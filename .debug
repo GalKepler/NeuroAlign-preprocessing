@@ -7618,3 +7618,35 @@
 2026-01-21 23:11:35.004 - neuroalign_preprocessing.loaders.diffusion - DEBUG - diffusion.py:357 - _load_sessions_parallel -   SUCCESS: sub-BB00434_ses-202303150846
 2026-01-21 23:11:35.862 - neuroalign_preprocessing.loaders.diffusion - DEBUG - diffusion.py:361 - _load_sessions_parallel -   SKIP: sub-867_ses-202302060948 - no data found
 2026-01-21 23:11:36.463 - neuroalign_preprocessing.loaders.diffusion - DEBUG - diffusion.py:357 - _load_sessions_parallel -   SUCCESS: sub-BB00441_ses-202303121505
+2026-01-21 23:11:38.429 - neuroalign_preprocessing.loaders.diffusion - DEBUG - diffusion.py:357 - _load_sessions_parallel -   SUCCESS: sub-BB00435_ses-202303091410
+2026-01-21 23:11:39.777 - neuroalign_preprocessing.loaders.diffusion - DEBUG - diffusion.py:361 - _load_sessions_parallel -   SKIP: sub-858_ses-202302050836 - no data found
+2026-01-21 23:11:40.533 - neuroalign_preprocessing.loaders.diffusion - DEBUG - diffusion.py:357 - _load_sessions_parallel -   SUCCESS: sub-BB00440_ses-202303131123
+2026-01-21 23:11:41.162 - neuroalign_preprocessing.loaders.diffusion - DEBUG - diffusion.py:361 - _load_sessions_parallel -   SKIP: sub-824_ses-202302020904 - no data found
+2026-01-21 23:11:41.952 - neuroalign_preprocessing.loaders.diffusion - DEBUG - diffusion.py:357 - _load_sessions_parallel -   SUCCESS: sub-BB00432_ses-202303081309
+2026-01-21 23:11:42.706 - neuroalign_preprocessing.loaders.diffusion - DEBUG - diffusion.py:361 - _load_sessions_parallel -   SKIP: sub-840_ses-202302011128 - no data found
+2026-01-21 23:11:44.505 - neuroalign_preprocessing.loaders.diffusion - DEBUG - diffusion.py:357 - _load_sessions_parallel -   SUCCESS: sub-BB00431_ses-202302261301
+2026-01-21 23:11:44.783 - neuroalign_preprocessing.loaders.diffusion - DEBUG - diffusion.py:357 - _load_sessions_parallel -   SUCCESS: sub-BB00430_ses-202302260846
+2026-01-21 23:11:46.005 - neuroalign_preprocessing.loaders.diffusion - DEBUG - diffusion.py:361 - _load_sessions_parallel -   SKIP: sub-844_ses-202301311625 - no data found
+2026-01-21 23:11:46.021 - neuroalign_preprocessing.loaders.diffusion - DEBUG - diffusion.py:361 - _load_sessions_parallel -   SKIP: sub-846_ses-202301311519 - no data found
+2026-01-21 23:11:48.205 - neuroalign_preprocessing.loaders.diffusion - DEBUG - diffusion.py:357 - _load_sessions_parallel -   SUCCESS: sub-BB00427_ses-202302231346
+2026-01-21 23:11:52.031 - neuroalign_preprocessing.loaders.diffusion - DEBUG - diffusion.py:357 - _load_sessions_parallel -   SUCCESS: sub-BB00429_ses-202302231042
+2026-01-21 23:11:57.538 - neuroalign_preprocessing.loaders.diffusion - DEBUG - diffusion.py:357 - _load_sessions_parallel -   SUCCESS: sub-BB00417_ses-202302221905
+2026-01-21 23:11:57.568 - neuroalign_preprocessing.loaders.diffusion - DEBUG - diffusion.py:357 - _load_sessions_parallel -   SUCCESS: sub-BB00428_ses-202302222018
+2026-01-21 23:11:58.254 - neuroalign_preprocessing.loaders.diffusion - DEBUG - diffusion.py:361 - _load_sessions_parallel -   SKIP: sub-862_ses-202301301751 - no data found
+2026-01-21 23:11:58.429 - neuroalign_preprocessing.loaders.diffusion - DEBUG - diffusion.py:361 - _load_sessions_parallel -   SKIP: sub-814_ses-202301301854 - no data found
+2026-01-21 23:11:59.890 - neuroalign_preprocessing.loaders.diffusion - DEBUG - diffusion.py:361 - _load_sessions_parallel -   SKIP: sub-819_ses-202301301638 - no data found
+2026-01-21 23:12:01.192 - neuroalign_preprocessing.loaders.diffusion - DEBUG - diffusion.py:361 - _load_sessions_parallel -   SKIP: sub-820_ses-202301291850 - no data found
+2026-01-21 23:12:02.256 - neuroalign_preprocessing.loaders.diffusion - DEBUG - diffusion.py:361 - _load_sessions_parallel -   SKIP: sub-823_ses-202301291723 - no data found
+2026-01-21 23:12:05.833 - neuroalign_preprocessing.loaders.diffusion - DEBUG - diffusion.py:357 - _load_sessions_parallel -   SUCCESS: sub-BB00424_ses-202302162011
+2026-01-21 23:12:08.269 - neuroalign_preprocessing.loaders.diffusion - DEBUG - diffusion.py:357 - _load_sessions_parallel -   SUCCESS: sub-BB00425_ses-202302141136
+2026-01-21 23:12:08.319 - neuroalign_preprocessing.loaders.diffusion - DEBUG - diffusion.py:357 - _load_sessions_parallel -   SUCCESS: sub-BB00426_ses-202302130952
+2026-01-21 23:12:08.504 - neuroalign_preprocessing.loaders.diffusion - DEBUG - diffusion.py:357 - _load_sessions_parallel -   SUCCESS: sub-BB00423_ses-202302131053
+2026-01-21 23:12:08.909 - neuroalign_preprocessing.loaders.diffusion - DEBUG - diffusion.py:357 - _load_sessions_parallel -   SUCCESS: sub-BB00419_ses-202302131212
+2026-01-21 23:12:16.532 - neuroalign_preprocessing.loaders.diffusion - DEBUG - diffusion.py:357 - _load_sessions_parallel -   SUCCESS: sub-BB00413_ses-202302081645
+2026-01-21 23:12:16.641 - neuroalign_preprocessing.loaders.diffusion - DEBUG - diffusion.py:357 - _load_sessions_parallel -   SUCCESS: sub-0600R_ses-202302131332
+2026-01-21 23:12:17.418 - neuroalign_preprocessing.loaders.diffusion - DEBUG - diffusion.py:361 - _load_sessions_parallel -   SKIP: sub-822_ses-202301241714 - no data found
+2026-01-21 23:12:19.905 - neuroalign_preprocessing.loaders.diffusion - DEBUG - diffusion.py:357 - _load_sessions_parallel -   SUCCESS: sub-BB00416_ses-202302061128
+2026-01-21 23:12:20.524 - neuroalign_preprocessing.loaders.diffusion - DEBUG - diffusion.py:357 - _load_sessions_parallel -   SUCCESS: sub-BB00415_ses-202302061224
+2026-01-21 23:12:20.737 - neuroalign_preprocessing.loaders.diffusion - DEBUG - diffusion.py:357 - _load_sessions_parallel -   SUCCESS: sub-BB00414_ses-202302051227
+2026-01-21 23:12:20.738 - neuroalign_preprocessing.loaders.diffusion - DEBUG - diffusion.py:357 - _load_sessions_parallel -   SUCCESS: sub-BB00418_ses-202302050941
+2026-01-21 23:12:26.367 - neuroalign_preprocessing.loaders.diffusion - DEBUG - diffusion.py:357 - _load_sessions_parallel -   SUCCESS: sub-BB00410_ses-202302021141

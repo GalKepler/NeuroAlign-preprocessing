@@ -19,7 +19,7 @@ import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import pandas as pd
 
@@ -234,6 +234,7 @@ class DiffusionLoader:
         workflow: Optional[str] = None,
         progress: bool = True,
         n_jobs: Optional[int] = None,
+        session_callback: Optional[Callable[[str, str, pd.DataFrame], None]] = None,
     ) -> pd.DataFrame:
         """
         Load diffusion data for multiple sessions.
@@ -243,6 +244,7 @@ class DiffusionLoader:
             workflow: Specific workflow to load, or None for all workflows
             progress: Whether to show progress bar
             n_jobs: Number of parallel workers (overrides instance setting)
+            session_callback: Optional callback(subject, session, df) called after each session loads
 
         Returns:
             DataFrame with all sessions' regional features
@@ -251,15 +253,16 @@ class DiffusionLoader:
         effective_jobs = n_jobs if n_jobs is not None else self.n_jobs
 
         if effective_jobs == 1:
-            return self._load_sessions_serial(sessions, workflow, progress)
+            return self._load_sessions_serial(sessions, workflow, progress, session_callback)
         else:
-            return self._load_sessions_parallel(sessions, workflow, progress, effective_jobs)
+            return self._load_sessions_parallel(sessions, workflow, progress, effective_jobs, session_callback)
 
     def _load_sessions_serial(
         self,
         sessions: pd.DataFrame,
         workflow: Optional[str],
         progress: bool,
+        session_callback: Optional[Callable[[str, str, pd.DataFrame], None]] = None,
     ) -> pd.DataFrame:
         """
         Serial loading (original behavior).
@@ -268,6 +271,7 @@ class DiffusionLoader:
             sessions: DataFrame with subject_code and session_id columns
             workflow: Specific workflow to load
             progress: Whether to show progress bar
+            session_callback: Optional callback(subject, session, df) called after each session
 
         Returns:
             DataFrame with all sessions' regional features
@@ -284,13 +288,23 @@ class DiffusionLoader:
                 pass
 
         for _, row in iterator:
+            subject = row["subject_code"]
+            session = row["session_id"]
             session_data = self.load_session(
-                subject=row["subject_code"], session=row["session_id"], workflow=workflow
+                subject=subject, session=session, workflow=workflow
             )
             if session_data is not None:
                 for col in sessions.columns:
                     if col not in session_data.columns:
                         session_data[col] = row[col]
+
+                # Call callback if provided
+                if session_callback is not None:
+                    try:
+                        session_callback(subject, session, session_data)
+                    except Exception as e:
+                        logger.warning(f"Session callback failed for {subject}/{session}: {e}")
+
                 results.append(session_data)
 
         if not results:
@@ -304,6 +318,7 @@ class DiffusionLoader:
         workflow: Optional[str],
         progress: bool,
         n_jobs: int,
+        session_callback: Optional[Callable[[str, str, pd.DataFrame], None]] = None,
     ) -> pd.DataFrame:
         """
         Parallel loading using ThreadPoolExecutor.
@@ -316,6 +331,7 @@ class DiffusionLoader:
             workflow: Specific workflow to load
             progress: Whether to show progress bar
             n_jobs: Number of parallel workers
+            session_callback: Optional callback(subject, session, df) called after each session
 
         Returns:
             DataFrame with all sessions' regional features
@@ -352,6 +368,13 @@ class DiffusionLoader:
                 try:
                     subject, session, session_data = fut.result()
                     if session_data is not None:
+                        # Call callback if provided
+                        if session_callback is not None:
+                            try:
+                                session_callback(subject, session, session_data)
+                            except Exception as e:
+                                logger.warning(f"Session callback failed for {subject}/{session}: {e}")
+
                         results.append(session_data)
                         success_count += 1
                         logger.debug(f"  SUCCESS: sub-{subject}_ses-{session}")

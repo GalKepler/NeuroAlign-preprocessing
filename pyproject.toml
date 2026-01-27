@@ -31,6 +31,7 @@ dev = [
 
 [project.scripts]
 neuroalign-preprocess = "neuroalign_preprocessing.preprocessing.cli:main"
+neuroalign-export-cache = "neuroalign_preprocessing.preprocessing.export_cache:main"
 
 [build-system]
 requires = ["hatchling"]

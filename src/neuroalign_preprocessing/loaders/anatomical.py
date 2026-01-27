@@ -22,7 +22,7 @@ import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import pandas as pd
 
@@ -158,7 +158,6 @@ class AnatomicalLoader:
         """
         session_dir = (
             self.paths.cat12_parcellated_root
-            / "cat12"
             / f"sub-{subject}"
             / f"ses-{session}"
             / "anat"
@@ -318,6 +317,7 @@ class AnatomicalLoader:
         normalize_by_tiv: bool = False,
         tiv_output_dir: Optional[Path] = None,  # Kept for API compatibility, not used
         calculate_tiv: bool = True,
+        session_callback: Optional[Callable[[str, str, pd.DataFrame], None]] = None,
     ) -> pd.DataFrame:
         """
         Load anatomical data for multiple sessions.
@@ -332,17 +332,22 @@ class AnatomicalLoader:
             normalize_by_tiv: Whether to normalize volumes by TIV
             tiv_output_dir: Kept for API compatibility (not used - TIV from XML)
             calculate_tiv: Whether to extract TIV from XML files
+            session_callback: Optional callback(subject, session, df) called after each session loads
 
         Returns:
             DataFrame with all sessions' regional features
         """
-        sessions = pd.read_csv(sessions_csv, dtype={"subject_code": str, "session_id": str})
+        sessions = pd.read_csv(
+            sessions_csv, dtype={"subject_code": str, "session_id": str}
+        )
         effective_jobs = n_jobs if n_jobs is not None else self.n_jobs
 
         if effective_jobs == 1:
-            df = self._load_sessions_serial(sessions, progress, calculate_tiv)
+            df = self._load_sessions_serial(sessions, progress, calculate_tiv, session_callback)
         else:
-            df = self._load_sessions_parallel(sessions, progress, effective_jobs, calculate_tiv)
+            df = self._load_sessions_parallel(
+                sessions, progress, effective_jobs, calculate_tiv, session_callback
+            )
 
         # Optionally normalize volume columns by TIV
         if normalize_by_tiv and "tiv" in df.columns:
@@ -352,7 +357,9 @@ class AnatomicalLoader:
                     df.loc[volume_mask, "volume_mm3_normalized"] = (
                         df.loc[volume_mask, "volume_mm3"] / df.loc[volume_mask, "tiv"]
                     )
-                    logger.info(f"Normalized {volume_mask.sum()} volume measurements by TIV")
+                    logger.info(
+                        f"Normalized {volume_mask.sum()} volume measurements by TIV"
+                    )
 
         return df
 
@@ -361,6 +368,7 @@ class AnatomicalLoader:
         sessions: pd.DataFrame,
         progress: bool,
         include_tiv: bool,
+        session_callback: Optional[Callable[[str, str, pd.DataFrame], None]] = None,
     ) -> pd.DataFrame:
         """
         Serial loading.
@@ -369,6 +377,7 @@ class AnatomicalLoader:
             sessions: DataFrame with subject_code and session_id columns
             progress: Whether to show progress bar
             include_tiv: Whether to extract TIV
+            session_callback: Optional callback(subject, session, df) called after each session
 
         Returns:
             DataFrame with all sessions' regional features
@@ -380,7 +389,9 @@ class AnatomicalLoader:
             try:
                 from tqdm import tqdm
 
-                iterator = tqdm(iterator, total=len(sessions), desc="Loading anatomical data")
+                iterator = tqdm(
+                    iterator, total=len(sessions), desc="Loading anatomical data"
+                )
             except ImportError:
                 pass
 
@@ -400,6 +411,14 @@ class AnatomicalLoader:
                 for col in sessions.columns:
                     if col not in session_data.columns:
                         session_data[col] = row[col]
+
+                # Call callback if provided
+                if session_callback is not None:
+                    try:
+                        session_callback(subject, session, session_data)
+                    except Exception as e:
+                        logger.warning(f"Session callback failed for {subject}/{session}: {e}")
+
                 results.append(session_data)
 
         if not results:
@@ -413,6 +432,7 @@ class AnatomicalLoader:
         progress: bool,
         n_jobs: int,
         include_tiv: bool,
+        session_callback: Optional[Callable[[str, str, pd.DataFrame], None]] = None,
     ) -> pd.DataFrame:
         """
         Parallel loading using ThreadPoolExecutor.
@@ -452,7 +472,9 @@ class AnatomicalLoader:
                 try:
                     from tqdm import tqdm
 
-                    iterator = tqdm(iterator, total=len(futures), desc="Loading anatomical data")
+                    iterator = tqdm(
+                        iterator, total=len(futures), desc="Loading anatomical data"
+                    )
                 except ImportError:
                     pass
 
@@ -460,13 +482,22 @@ class AnatomicalLoader:
                 try:
                     subject, session, session_data = fut.result()
                     if session_data is not None:
+                        # Call callback if provided
+                        if session_callback is not None:
+                            try:
+                                session_callback(subject, session, session_data)
+                            except Exception as e:
+                                logger.warning(f"Session callback failed for {subject}/{session}: {e}")
+
                         results.append(session_data)
                         success_count += 1
                         logger.debug(f"  SUCCESS: sub-{subject}_ses-{session}")
                     else:
                         skip_count += 1
                         failed_sessions.append((subject, session, "no_data"))
-                        logger.debug(f"  SKIP: sub-{subject}_ses-{session} - no data found")
+                        logger.debug(
+                            f"  SKIP: sub-{subject}_ses-{session} - no data found"
+                        )
                 except Exception as e:
                     error_count += 1
                     logger.error(f"Worker exception: {e}", exc_info=True)

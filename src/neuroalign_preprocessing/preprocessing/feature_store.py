@@ -35,10 +35,11 @@ Example:
 
 import json
 import logging
+import sqlite3
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional, Union
+from typing import Any, Dict, List, Literal, Optional, Set, Tuple, Union
 
 import pandas as pd
 
@@ -269,6 +270,11 @@ class FeatureStore:
     def manifest_path(self) -> Path:
         return self.root_dir / "manifest.json"
 
+    @property
+    def cache_db_path(self) -> Path:
+        """SQLite database for incremental saving during loading."""
+        return self.root_dir / ".cache.db"
+
     def _ensure_dirs(self) -> None:
         """Create directory structure."""
         self.long_dir.mkdir(parents=True, exist_ok=True)
@@ -302,6 +308,286 @@ class FeatureStore:
     def exists(self) -> bool:
         """Check if the store exists and has data."""
         return self.manifest_path.exists()
+
+    # -------------------------------------------------------------------------
+    # SQLite cache for incremental saving
+    # -------------------------------------------------------------------------
+
+    def _init_cache_db(self) -> None:
+        """Initialize SQLite database for incremental saving."""
+        self._ensure_dirs()
+        conn = sqlite3.connect(self.cache_db_path)
+        cursor = conn.cursor()
+
+        # Simple table to track completed sessions
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS completed_sessions (
+                subject_code TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                modality TEXT NOT NULL,
+                completed_at TEXT NOT NULL,
+                PRIMARY KEY (subject_code, session_id, modality)
+            )
+        """)
+
+        conn.commit()
+        conn.close()
+        logger.debug(f"Initialized cache database: {self.cache_db_path}")
+
+    def get_cached_sessions(self, modality: str = "anatomical") -> Set[Tuple[str, str]]:
+        """
+        Get set of sessions already cached.
+
+        Args:
+            modality: "anatomical" or "diffusion"
+
+        Returns:
+            Set of (subject_code, session_id) tuples
+        """
+        if not self.cache_db_path.exists():
+            return set()
+
+        conn = sqlite3.connect(self.cache_db_path)
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT DISTINCT subject_code, session_id FROM completed_sessions WHERE modality = ?",
+            (modality,)
+        )
+        sessions = set(cursor.fetchall())
+        conn.close()
+        return sessions
+
+    def append_anatomical_session(
+        self,
+        df: pd.DataFrame,
+        subject_code: str,
+        session_id: str,
+        modality: str,
+    ) -> None:
+        """
+        Append a single anatomical session to SQLite cache.
+
+        Args:
+            df: Session data from AnatomicalLoader
+            subject_code: Subject identifier
+            session_id: Session identifier
+            modality: "gm", "wm", or "ct"
+        """
+        logger.debug(f"append_anatomical_session called: {subject_code}/{session_id} ({modality}), {len(df)} rows")
+
+        if not self.cache_db_path.exists():
+            logger.info(f"Initializing cache database at: {self.cache_db_path}")
+            self._init_cache_db()
+
+        conn = sqlite3.connect(self.cache_db_path)
+
+        # Ensure subject/session columns exist
+        df_copy = df.copy()
+        if 'subject_code' not in df_copy.columns:
+            df_copy['subject_code'] = subject_code
+        if 'session_id' not in df_copy.columns:
+            df_copy['session_id'] = session_id
+
+        # Store in table specific to modality (auto-creates schema)
+        table_name = f"anatomical_{modality}"
+        logger.debug(f"Writing to cache table: {table_name}")
+        df_copy.to_sql(table_name, conn, if_exists='append', index=False)
+
+        # Mark session as completed
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT OR REPLACE INTO completed_sessions (subject_code, session_id, modality, completed_at) VALUES (?, ?, ?, ?)",
+            (subject_code, session_id, "anatomical", datetime.now().isoformat())
+        )
+
+        conn.commit()
+        conn.close()
+        logger.info(f"✓ Cached {modality}: {subject_code}/{session_id} → {self.cache_db_path}")
+
+    def append_diffusion_session(
+        self,
+        df: pd.DataFrame,
+        subject_code: str,
+        session_id: str,
+        workflow: Optional[str] = None,
+    ) -> None:
+        """
+        Append a single diffusion session to SQLite cache.
+
+        Args:
+            df: Session data from DiffusionLoader
+            subject_code: Subject identifier
+            session_id: Session identifier
+            workflow: Workflow name (if None, uses workflow column from df)
+        """
+        if not self.cache_db_path.exists():
+            self._init_cache_db()
+
+        conn = sqlite3.connect(self.cache_db_path)
+
+        df_copy = df.copy()
+        if 'subject_code' not in df_copy.columns:
+            df_copy['subject_code'] = subject_code
+        if 'session_id' not in df_copy.columns:
+            df_copy['session_id'] = session_id
+
+        # Store each workflow separately
+        if workflow:
+            workflows = [workflow]
+        elif 'workflow' in df_copy.columns:
+            workflows = df_copy['workflow'].unique()
+        else:
+            workflows = ['unknown']
+
+        for wf in workflows:
+            if 'workflow' in df_copy.columns:
+                wf_df = df_copy[df_copy['workflow'] == wf].copy()
+            else:
+                wf_df = df_copy.copy()
+
+            table_name = f"diffusion_{wf}"
+            wf_df.to_sql(table_name, conn, if_exists='append', index=False)
+
+        # Mark session as completed
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT OR REPLACE INTO completed_sessions (subject_code, session_id, modality, completed_at) VALUES (?, ?, ?, ?)",
+            (subject_code, session_id, "diffusion", datetime.now().isoformat())
+        )
+
+        conn.commit()
+        conn.close()
+        logger.debug(f"Cached diffusion session: {subject_code}/{session_id}")
+
+    def export_cache_to_parquet(self, atlas_name: str = "") -> List[str]:
+        """
+        Export SQLite cache to Parquet files and update manifest.
+
+        Args:
+            atlas_name: Name of atlas used (for metadata)
+
+        Returns:
+            List of long format names saved
+        """
+        if not self.cache_db_path.exists():
+            logger.warning("No cache database found - nothing to export")
+            return []
+
+        logger.info("Exporting cache to Parquet files...")
+        conn = sqlite3.connect(self.cache_db_path)
+        cursor = conn.cursor()
+        long_formats_saved = []
+
+        # Get list of all tables
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        tables = [row[0] for row in cursor.fetchall() if row[0] != 'completed_sessions']
+
+        for table_name in tables:
+            try:
+                df = pd.read_sql(f"SELECT * FROM {table_name}", conn)
+                if len(df) == 0:
+                    continue
+
+                # Determine if anatomical or diffusion
+                if table_name.startswith("anatomical_"):
+                    modality = table_name.replace("anatomical_", "")
+                    name = self.save_anatomical_long(df, modality=modality, atlas_name=atlas_name)
+                    long_formats_saved.append(name)
+                    logger.info(f"Exported anatomical {modality}: {len(df)} rows")
+
+                elif table_name.startswith("diffusion_"):
+                    workflow = table_name.replace("diffusion_", "")
+                    name = self.save_diffusion_long(df, workflow=workflow)
+                    long_formats_saved.append(name)
+                    logger.info(f"Exported diffusion {workflow}: {len(df)} rows")
+
+            except Exception as e:
+                logger.error(f"Failed to export table {table_name}: {e}")
+
+        conn.close()
+        logger.info(f"Exported {len(long_formats_saved)} long formats from cache")
+        return long_formats_saved
+
+    def clear_cache(self) -> None:
+        """Delete the SQLite cache database."""
+        if self.cache_db_path.exists():
+            self.cache_db_path.unlink()
+            logger.info("Cleared cache database")
+
+    def has_cache(self) -> bool:
+        """Check if SQLite cache exists and has data."""
+        if not self.cache_db_path.exists():
+            return False
+
+        conn = sqlite3.connect(self.cache_db_path)
+        cursor = conn.cursor()
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        tables = [row[0] for row in cursor.fetchall() if row[0] != 'completed_sessions']
+        conn.close()
+        return len(tables) > 0
+
+    def cache_status(self) -> Dict[str, Any]:
+        """
+        Get status of SQLite cache.
+
+        Returns:
+            Dictionary with cache statistics
+        """
+        if not self.cache_db_path.exists():
+            return {
+                "exists": False,
+                "n_sessions_anatomical": 0,
+                "n_sessions_diffusion": 0,
+                "tables": [],
+                "size_mb": 0,
+            }
+
+        conn = sqlite3.connect(self.cache_db_path)
+        cursor = conn.cursor()
+
+        # Get table names
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        tables = [row[0] for row in cursor.fetchall()]
+
+        # Count sessions
+        anatomical_sessions = self.get_cached_sessions("anatomical")
+        diffusion_sessions = self.get_cached_sessions("diffusion")
+
+        # Get database size
+        size_mb = self.cache_db_path.stat().st_size / (1024 * 1024)
+
+        conn.close()
+
+        return {
+            "exists": True,
+            "n_sessions_anatomical": len(anatomical_sessions),
+            "n_sessions_diffusion": len(diffusion_sessions),
+            "tables": [t for t in tables if t != 'completed_sessions'],
+            "size_mb": round(size_mb, 2),
+        }
+
+    def load_from_cache(self, table_name: str) -> Optional[pd.DataFrame]:
+        """
+        Load data from SQLite cache table.
+
+        Args:
+            table_name: Table name (e.g., "anatomical_gm", "diffusion_AMICONODDI")
+
+        Returns:
+            DataFrame or None if table doesn't exist
+        """
+        if not self.cache_db_path.exists():
+            return None
+
+        try:
+            conn = sqlite3.connect(self.cache_db_path)
+            df = pd.read_sql(f"SELECT * FROM {table_name}", conn)
+            conn.close()
+            logger.info(f"Loaded {len(df)} rows from cache table: {table_name}")
+            return df
+        except Exception as e:
+            logger.debug(f"Failed to load from cache table {table_name}: {e}")
+            return None
 
     # -------------------------------------------------------------------------
     # Long format storage (raw parcellator output)
@@ -410,12 +696,13 @@ class FeatureStore:
 
         return name
 
-    def load_long(self, name: str) -> pd.DataFrame:
+    def load_long(self, name: str, fallback_to_cache: bool = True) -> pd.DataFrame:
         """
         Load long-format data.
 
         Args:
             name: Long format name (e.g., "anatomical_gm", "diffusion_AMICONODDI")
+            fallback_to_cache: If True, try loading from SQLite cache if Parquet doesn't exist
 
         Returns:
             DataFrame with all parcellator columns
@@ -423,11 +710,34 @@ class FeatureStore:
         manifest = self._load_manifest()
         info = manifest.get_long_format(name)
 
-        if info is None:
-            raise ValueError(f"Long format '{name}' not found. Available: {self.list_long_formats()}")
+        # Try loading from Parquet first
+        if info is not None:
+            file_path = self.root_dir / info.file_path
+            if file_path.exists():
+                return pd.read_parquet(file_path)
 
-        file_path = self.root_dir / info.file_path
-        return pd.read_parquet(file_path)
+        # Fall back to cache if Parquet doesn't exist
+        if fallback_to_cache and self.has_cache():
+            logger.info(f"Parquet not found for '{name}', trying SQLite cache...")
+            cache_df = self.load_from_cache(name)
+            if cache_df is not None:
+                logger.info(f"Loaded '{name}' from cache ({len(cache_df)} rows)")
+                return cache_df
+
+        # Neither Parquet nor cache available
+        available = self.list_long_formats()
+        cache_tables = []
+        if self.has_cache():
+            cache_status = self.cache_status()
+            cache_tables = cache_status.get('tables', [])
+
+        error_msg = f"Long format '{name}' not found."
+        if available:
+            error_msg += f" Available in Parquet: {available}"
+        if cache_tables:
+            error_msg += f" Available in cache: {cache_tables}"
+
+        raise ValueError(error_msg)
 
     def list_long_formats(self) -> List[str]:
         """List available long-format data files."""
@@ -778,19 +1088,46 @@ class FeatureStore:
     # -------------------------------------------------------------------------
 
     def get_existing_sessions(self) -> pd.DataFrame:
-        """Get all subject-session pairs in the store."""
-        if not self.metadata_path.exists():
-            return pd.DataFrame(columns=["subject_code", "session_id"])
+        """
+        Get all subject-session pairs in the store.
 
-        meta = pd.read_parquet(self.metadata_path)
-        return meta[["subject_code", "session_id"]].drop_duplicates()
+        Checks both:
+        1. Metadata parquet (fully processed sessions)
+        2. SQLite cache (sessions loaded but not yet exported)
+
+        Returns:
+            DataFrame with subject_code and session_id columns
+        """
+        existing = []
+
+        # Check parquet metadata
+        if self.metadata_path.exists():
+            meta = pd.read_parquet(self.metadata_path)
+            existing.append(meta[["subject_code", "session_id"]].drop_duplicates())
+
+        # Check SQLite cache for sessions not yet exported
+        if self.cache_db_path.exists():
+            anatomical_cached = self.get_cached_sessions("anatomical")
+            if anatomical_cached:
+                cached_df = pd.DataFrame(list(anatomical_cached), columns=["subject_code", "session_id"])
+                existing.append(cached_df)
+
+        if existing:
+            combined = pd.concat(existing, ignore_index=True)
+            return combined.drop_duplicates()
+        else:
+            return pd.DataFrame(columns=["subject_code", "session_id"])
 
     # -------------------------------------------------------------------------
     # Summary
     # -------------------------------------------------------------------------
 
     def summary(self) -> Dict[str, Any]:
-        """Get summary statistics about the feature store."""
+        """
+        Get summary statistics about the feature store.
+
+        Includes both exported Parquet files and cached SQLite data.
+        """
         manifest = self._load_manifest()
 
         anatomical_features = [
@@ -800,6 +1137,9 @@ class FeatureStore:
             n for n, f in manifest.wide_features.items() if f.get("modality") == "diffusion"
         ]
 
+        # Add cache status
+        cache_info = self.cache_status()
+
         return {
             "root_dir": str(self.root_dir),
             "atlas_name": manifest.atlas_name,
@@ -807,6 +1147,7 @@ class FeatureStore:
             "n_subjects": manifest.n_subjects,
             "long_formats": list(manifest.long_formats.keys()),
             "n_wide_features": len(manifest.wide_features),
+            "cache": cache_info,
             "anatomical_features": anatomical_features,
             "diffusion_features": diffusion_features,
             "has_tiv": manifest.has_tiv,

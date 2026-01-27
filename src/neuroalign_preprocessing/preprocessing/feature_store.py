@@ -36,6 +36,8 @@ Example:
 import json
 import logging
 import sqlite3
+import threading
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -218,6 +220,10 @@ class FeatureStore:
     Also stores TIV (Total Intracranial Volume) separately for normalization.
     """
 
+    # Class-level lock dictionary for per-path SQLite write serialization
+    _cache_locks: Dict[str, threading.Lock] = {}
+    _cache_locks_lock = threading.Lock()
+
     def __init__(
         self,
         root_dir: Union[str, Path],
@@ -233,6 +239,13 @@ class FeatureStore:
         self.root_dir = Path(root_dir)
         self.compression = compression
         self._manifest: Optional[StoreManifest] = None
+
+        # Get or create a lock for this specific cache path
+        cache_path_str = str(self.cache_db_path)
+        with FeatureStore._cache_locks_lock:
+            if cache_path_str not in FeatureStore._cache_locks:
+                FeatureStore._cache_locks[cache_path_str] = threading.Lock()
+            self._cache_lock = FeatureStore._cache_locks[cache_path_str]
 
     # -------------------------------------------------------------------------
     # Directory structure
@@ -314,25 +327,33 @@ class FeatureStore:
     # -------------------------------------------------------------------------
 
     def _init_cache_db(self) -> None:
-        """Initialize SQLite database for incremental saving."""
+        """Initialize SQLite database for incremental saving with WAL mode."""
         self._ensure_dirs()
-        conn = sqlite3.connect(self.cache_db_path)
-        cursor = conn.cursor()
 
-        # Simple table to track completed sessions
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS completed_sessions (
-                subject_code TEXT NOT NULL,
-                session_id TEXT NOT NULL,
-                modality TEXT NOT NULL,
-                completed_at TEXT NOT NULL,
-                PRIMARY KEY (subject_code, session_id, modality)
-            )
-        """)
+        with self._cache_lock:
+            conn = sqlite3.connect(self.cache_db_path, timeout=60.0)
+            cursor = conn.cursor()
 
-        conn.commit()
-        conn.close()
-        logger.debug(f"Initialized cache database: {self.cache_db_path}")
+            # Enable WAL mode for better concurrent access
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")  # Faster, still crash-safe
+            cursor.execute("PRAGMA cache_size=-64000")  # 64MB cache
+            cursor.execute("PRAGMA busy_timeout=60000")  # 60 second timeout
+
+            # Simple table to track completed sessions
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS completed_sessions (
+                    subject_code TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    modality TEXT NOT NULL,
+                    completed_at TEXT NOT NULL,
+                    PRIMARY KEY (subject_code, session_id, modality)
+                )
+            """)
+
+            conn.commit()
+            conn.close()
+            logger.debug(f"Initialized cache database: {self.cache_db_path} (WAL mode)")
 
     def get_cached_sessions(self, modality: str = "anatomical") -> Set[Tuple[str, str]]:
         """
@@ -365,7 +386,7 @@ class FeatureStore:
         modality: str,
     ) -> None:
         """
-        Append a single anatomical session to SQLite cache.
+        Append a single anatomical session to SQLite cache (thread-safe).
 
         Args:
             df: Session data from AnatomicalLoader
@@ -379,30 +400,52 @@ class FeatureStore:
             logger.info(f"Initializing cache database at: {self.cache_db_path}")
             self._init_cache_db()
 
-        conn = sqlite3.connect(self.cache_db_path)
-
-        # Ensure subject/session columns exist
+        # Prepare data outside of lock
         df_copy = df.copy()
         if 'subject_code' not in df_copy.columns:
             df_copy['subject_code'] = subject_code
         if 'session_id' not in df_copy.columns:
             df_copy['session_id'] = session_id
 
-        # Store in table specific to modality (auto-creates schema)
         table_name = f"anatomical_{modality}"
-        logger.debug(f"Writing to cache table: {table_name}")
-        df_copy.to_sql(table_name, conn, if_exists='append', index=False)
 
-        # Mark session as completed
-        cursor = conn.cursor()
-        cursor.execute(
-            "INSERT OR REPLACE INTO completed_sessions (subject_code, session_id, modality, completed_at) VALUES (?, ?, ?, ?)",
-            (subject_code, session_id, "anatomical", datetime.now().isoformat())
-        )
+        # Use lock to serialize writes and avoid "database is locked" errors
+        with self._cache_lock:
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    conn = sqlite3.connect(self.cache_db_path, timeout=60.0)
 
-        conn.commit()
-        conn.close()
-        logger.info(f"✓ Cached {modality}: {subject_code}/{session_id} → {self.cache_db_path}")
+                    # Store in table specific to modality
+                    logger.debug(f"Writing to cache table: {table_name}")
+                    df_copy.to_sql(table_name, conn, if_exists='append', index=False)
+
+                    # Mark session as completed
+                    cursor = conn.cursor()
+                    cursor.execute(
+                        "INSERT OR REPLACE INTO completed_sessions (subject_code, session_id, modality, completed_at) VALUES (?, ?, ?, ?)",
+                        (subject_code, session_id, "anatomical", datetime.now().isoformat())
+                    )
+
+                    conn.commit()
+                    conn.close()
+                    logger.info(f"✓ Cached {modality}: {subject_code}/{session_id}")
+
+                    # Update metadata load status
+                    self.update_session_load_status(subject_code, session_id, modality, loaded=True)
+                    break
+
+                except sqlite3.OperationalError as e:
+                    if attempt < max_retries - 1 and "locked" in str(e).lower():
+                        logger.warning(f"Database locked, retry {attempt + 1}/{max_retries} for {subject_code}/{session_id}")
+                        time.sleep(0.5 * (attempt + 1))  # Exponential backoff
+                        try:
+                            conn.close()
+                        except Exception:
+                            pass
+                    else:
+                        logger.error(f"Failed to cache {subject_code}/{session_id} after {max_retries} attempts: {e}")
+                        raise
 
     def append_diffusion_session(
         self,
@@ -412,7 +455,7 @@ class FeatureStore:
         workflow: Optional[str] = None,
     ) -> None:
         """
-        Append a single diffusion session to SQLite cache.
+        Append a single diffusion session to SQLite cache (thread-safe).
 
         Args:
             df: Session data from DiffusionLoader
@@ -423,15 +466,14 @@ class FeatureStore:
         if not self.cache_db_path.exists():
             self._init_cache_db()
 
-        conn = sqlite3.connect(self.cache_db_path)
-
+        # Prepare data outside of lock
         df_copy = df.copy()
         if 'subject_code' not in df_copy.columns:
             df_copy['subject_code'] = subject_code
         if 'session_id' not in df_copy.columns:
             df_copy['session_id'] = session_id
 
-        # Store each workflow separately
+        # Determine workflows
         if workflow:
             workflows = [workflow]
         elif 'workflow' in df_copy.columns:
@@ -439,25 +481,53 @@ class FeatureStore:
         else:
             workflows = ['unknown']
 
+        # Prepare workflow dataframes outside lock
+        workflow_dfs = []
         for wf in workflows:
             if 'workflow' in df_copy.columns:
                 wf_df = df_copy[df_copy['workflow'] == wf].copy()
             else:
                 wf_df = df_copy.copy()
+            workflow_dfs.append((wf, wf_df))
 
-            table_name = f"diffusion_{wf}"
-            wf_df.to_sql(table_name, conn, if_exists='append', index=False)
+        # Use lock to serialize writes
+        with self._cache_lock:
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    conn = sqlite3.connect(self.cache_db_path, timeout=60.0)
 
-        # Mark session as completed
-        cursor = conn.cursor()
-        cursor.execute(
-            "INSERT OR REPLACE INTO completed_sessions (subject_code, session_id, modality, completed_at) VALUES (?, ?, ?, ?)",
-            (subject_code, session_id, "diffusion", datetime.now().isoformat())
-        )
+                    # Write each workflow
+                    for wf, wf_df in workflow_dfs:
+                        table_name = f"diffusion_{wf}"
+                        wf_df.to_sql(table_name, conn, if_exists='append', index=False)
 
-        conn.commit()
-        conn.close()
-        logger.debug(f"Cached diffusion session: {subject_code}/{session_id}")
+                    # Mark session as completed
+                    cursor = conn.cursor()
+                    cursor.execute(
+                        "INSERT OR REPLACE INTO completed_sessions (subject_code, session_id, modality, completed_at) VALUES (?, ?, ?, ?)",
+                        (subject_code, session_id, "diffusion", datetime.now().isoformat())
+                    )
+
+                    conn.commit()
+                    conn.close()
+                    logger.info(f"✓ Cached diffusion: {subject_code}/{session_id}")
+
+                    # Update metadata load status
+                    self.update_session_load_status(subject_code, session_id, "diffusion", loaded=True)
+                    break
+
+                except sqlite3.OperationalError as e:
+                    if attempt < max_retries - 1 and "locked" in str(e).lower():
+                        logger.warning(f"Database locked, retry {attempt + 1}/{max_retries} for {subject_code}/{session_id}")
+                        time.sleep(0.5 * (attempt + 1))
+                        try:
+                            conn.close()
+                        except Exception:
+                            pass
+                    else:
+                        logger.error(f"Failed to cache {subject_code}/{session_id} after {max_retries} attempts: {e}")
+                        raise
 
     def export_cache_to_parquet(self, atlas_name: str = "") -> List[str]:
         """
@@ -509,9 +579,32 @@ class FeatureStore:
         return long_formats_saved
 
     def clear_cache(self) -> None:
-        """Delete the SQLite cache database."""
+        """Delete the SQLite cache database and associated WAL files."""
         if self.cache_db_path.exists():
-            self.cache_db_path.unlink()
+            # Close any lingering connections by running checkpoint
+            try:
+                with self._cache_lock:
+                    conn = sqlite3.connect(self.cache_db_path, timeout=5.0)
+                    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                    conn.close()
+            except Exception as e:
+                logger.debug(f"Failed to checkpoint WAL before deletion: {e}")
+
+            # Delete main database file
+            try:
+                self.cache_db_path.unlink()
+            except Exception as e:
+                logger.warning(f"Failed to delete cache database: {e}")
+
+            # Delete WAL and SHM files if they exist
+            for suffix in ["-wal", "-shm"]:
+                wal_file = Path(str(self.cache_db_path) + suffix)
+                if wal_file.exists():
+                    try:
+                        wal_file.unlink()
+                    except Exception as e:
+                        logger.debug(f"Failed to delete {wal_file}: {e}")
+
             logger.info("Cleared cache database")
 
     def has_cache(self) -> bool:
@@ -603,6 +696,7 @@ class FeatureStore:
         Save raw anatomical parcellator output in long format.
 
         Preserves ALL columns from the parcellator (volume, mean, std, etc.).
+        If file exists, merges with existing data (removing duplicates).
 
         Args:
             df: Long-format DataFrame from AnatomicalLoader/parcellator
@@ -619,6 +713,24 @@ class FeatureStore:
 
         name = f"anatomical_{modality}"
         file_path = self.long_dir / f"{name}.parquet"
+
+        # If file exists, merge with existing data to avoid data loss
+        if file_path.exists():
+            logger.info(f"Merging with existing {name} data...")
+            existing_df = pd.read_parquet(file_path)
+
+            # Combine and remove duplicates (keep new data)
+            combined_df = pd.concat([existing_df, df], ignore_index=True)
+            combined_df = combined_df.drop_duplicates(
+                subset=["subject_code", "session_id", "label"],
+                keep="last"  # Keep the newer data
+            )
+
+            logger.info(
+                f"Merged {len(existing_df)} existing + {len(df)} new = "
+                f"{len(combined_df)} total sessions for {name}"
+            )
+            df = combined_df
 
         df.to_parquet(file_path, compression=self.compression, index=False)
 
@@ -656,6 +768,8 @@ class FeatureStore:
         """
         Save raw diffusion parcellator output in long format.
 
+        If file exists, merges with existing data (removing duplicates).
+
         Args:
             df: Long-format DataFrame from DiffusionLoader
             workflow: Workflow name (e.g., "AMICONODDI", "DSIStudio")
@@ -668,6 +782,24 @@ class FeatureStore:
 
         name = f"diffusion_{workflow}"
         file_path = self.diffusion_long_dir / f"{workflow}.parquet"
+
+        # If file exists, merge with existing data to avoid data loss
+        if file_path.exists():
+            logger.info(f"Merging with existing {name} data...")
+            existing_df = pd.read_parquet(file_path)
+
+            # Combine and remove duplicates (keep new data)
+            combined_df = pd.concat([existing_df, df], ignore_index=True)
+            combined_df = combined_df.drop_duplicates(
+                subset=["subject_code", "session_id", "label"],
+                keep="last"  # Keep the newer data
+            )
+
+            logger.info(
+                f"Merged {len(existing_df)} existing + {len(df)} new = "
+                f"{len(combined_df)} total rows for {name}"
+            )
+            df = combined_df
 
         df.to_parquet(file_path, compression=self.compression, index=False)
 
@@ -912,6 +1044,21 @@ class FeatureStore:
 
         tiv_df = df[required].drop_duplicates()
 
+        # Merge with existing TIV data if it exists
+        if self.tiv_path.exists():
+            logger.info("Merging with existing TIV data...")
+            existing_tiv = pd.read_parquet(self.tiv_path)
+            combined_tiv = pd.concat([existing_tiv, tiv_df], ignore_index=True)
+            combined_tiv = combined_tiv.drop_duplicates(
+                subset=["subject_code", "session_id"],
+                keep="last"
+            )
+            logger.info(
+                f"Merged {len(existing_tiv)} existing + {len(tiv_df)} new = "
+                f"{len(combined_tiv)} total TIV sessions"
+            )
+            tiv_df = combined_tiv
+
         # Save as standalone TIV file (backwards compatibility)
         tiv_df.to_parquet(self.tiv_path, compression=self.compression, index=False)
 
@@ -953,40 +1100,112 @@ class FeatureStore:
     # Metadata storage
     # -------------------------------------------------------------------------
 
-    def save_metadata(self, df: pd.DataFrame, age_col: str = "AGE") -> None:
+    def initialize_metadata(self, sessions_df: pd.DataFrame, age_col: str = "AGE") -> None:
         """
-        Save session metadata (AGE, etc.).
+        Initialize metadata with ALL sessions from input CSV and load status columns.
 
         Args:
-            df: DataFrame with subject_code, session_id, and metadata columns
+            sessions_df: DataFrame with all sessions from input CSV
             age_col: Name of age column in input
         """
+        # Get session identifiers and metadata
         cols = ["subject_code", "session_id"]
 
         # Handle age column
         for col in [age_col, "AGE", "Age@Scan", "age", "Age"]:
-            if col in df.columns:
+            if col in sessions_df.columns:
                 cols.append(col)
                 break
 
-        # Include other metadata columns
+        # Include other metadata columns (but not features)
         feature_prefixes = ("gm_", "wm_", "ct_", "DSIStudio", "MRtrix", "DIPY", "AMICO")
-        for col in df.columns:
+        for col in sessions_df.columns:
             if col not in cols and not any(col.startswith(p) for p in feature_prefixes):
                 if col not in ANATOMICAL_METRICS and col not in REGION_ID_COLS:
                     cols.append(col)
 
         # Only keep columns that exist
-        cols = [c for c in cols if c in df.columns]
-
-        meta_df = df[cols].drop_duplicates()
+        cols = [c for c in cols if c in sessions_df.columns]
+        meta_df = sessions_df[cols].drop_duplicates()
 
         # Standardize age column name
         if age_col in meta_df.columns and age_col != "AGE":
             meta_df = meta_df.rename(columns={age_col: "AGE"})
 
+        # Add load status columns (initially False)
+        meta_df["anatomical_gm_loaded"] = False
+        meta_df["anatomical_wm_loaded"] = False
+        meta_df["anatomical_ct_loaded"] = False
+        meta_df["diffusion_loaded"] = False
+
+        # Check cache for already loaded sessions
+        if self.has_cache():
+            anatomical_cached = self.get_cached_sessions("anatomical")
+            diffusion_cached = self.get_cached_sessions("diffusion")
+
+            for subject, session in anatomical_cached:
+                mask = (meta_df["subject_code"] == subject) & (meta_df["session_id"] == session)
+                meta_df.loc[mask, ["anatomical_gm_loaded", "anatomical_wm_loaded", "anatomical_ct_loaded"]] = True
+
+            for subject, session in diffusion_cached:
+                mask = (meta_df["subject_code"] == subject) & (meta_df["session_id"] == session)
+                meta_df.loc[mask, "diffusion_loaded"] = True
+
         meta_df.to_parquet(self.metadata_path, compression=self.compression, index=False)
-        logger.info(f"Saved metadata: {len(meta_df)} sessions")
+        logger.info(f"Initialized metadata: {len(meta_df)} sessions total")
+
+    def update_session_load_status(
+        self,
+        subject_code: str,
+        session_id: str,
+        modality: str,
+        loaded: bool = True
+    ) -> None:
+        """
+        Update load status for a specific session and modality.
+
+        Args:
+            subject_code: Subject identifier
+            session_id: Session identifier
+            modality: "gm", "wm", "ct", or "diffusion"
+            loaded: Whether data was loaded
+        """
+        if not self.metadata_path.exists():
+            logger.warning("Metadata not initialized, cannot update load status")
+            return
+
+        meta_df = self.load_metadata()
+
+        # Find matching session
+        mask = (meta_df["subject_code"] == subject_code) & (meta_df["session_id"] == session_id)
+
+        if not mask.any():
+            logger.warning(f"Session {subject_code}/{session_id} not found in metadata")
+            return
+
+        # Update appropriate column
+        if modality == "diffusion":
+            col = "diffusion_loaded"
+        else:
+            col = f"anatomical_{modality}_loaded"
+
+        if col not in meta_df.columns:
+            meta_df[col] = False
+
+        meta_df.loc[mask, col] = loaded
+
+        # Save updated metadata
+        meta_df.to_parquet(self.metadata_path, compression=self.compression, index=False)
+        logger.debug(f"Updated load status: {subject_code}/{session_id} {col}={loaded}")
+
+    def save_metadata(self, df: pd.DataFrame, age_col: str = "AGE") -> None:
+        """
+        DEPRECATED: Use initialize_metadata() instead.
+
+        This method is kept for backward compatibility but should not be used for new code.
+        """
+        logger.warning("save_metadata() is deprecated, use initialize_metadata() instead")
+        self.initialize_metadata(df, age_col)
 
     def load_metadata(self) -> pd.DataFrame:
         """Load session metadata."""

@@ -128,41 +128,164 @@ class DataPreparationPipeline:
             modalities.append("ct")
         return modalities
 
-    def _get_sessions_to_load(self, store: FeatureStore) -> tuple[pd.DataFrame, int]:
+    def _get_sessions_to_load(
+        self, store: FeatureStore
+    ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, int]:
         """
-        Get sessions that need to be loaded.
+        Get sessions that need to be loaded based on load status flags.
 
-        If force=True or store doesn't exist, returns all sessions.
-        Otherwise, returns only sessions not already in the store.
+        Returns separate session lists for anatomical and diffusion to avoid
+        redundant processing.
+
+        Returns:
+            Tuple of (all_sessions, anatomical_sessions, diffusion_sessions, n_skipped)
         """
         all_sessions = self._load_sessions_csv()
 
-        if self.config.force or not store.exists():
-            logger.info("Loading all sessions (force=True or new store)")
-            return all_sessions, 0
+        if self.config.force:
+            logger.info("Loading all sessions (force=True)")
+            # Reset load status flags
+            if store.metadata_path.exists():
+                meta = store.load_metadata()
+                for col in [
+                    "anatomical_gm_loaded",
+                    "anatomical_wm_loaded",
+                    "anatomical_ct_loaded",
+                    "diffusion_loaded",
+                ]:
+                    if col in meta.columns:
+                        meta[col] = False
+                meta.to_parquet(
+                    store.metadata_path, compression=store.compression, index=False
+                )
+            return all_sessions, all_sessions, all_sessions, 0
 
-        existing = store.get_existing_sessions()
+        # Check metadata for load status
+        if not store.metadata_path.exists():
+            logger.info("No metadata found - loading all sessions")
+            return all_sessions, all_sessions, all_sessions, 0
 
-        if existing.empty:
-            return all_sessions, 0
+        meta = store.load_metadata()
 
-        merged = all_sessions.merge(
-            existing,
-            on=["subject_code", "session_id"],
-            how="left",
-            indicator=True,
+        # Determine which modalities are enabled
+        needs_anatomical_gm = (
+            self.config.modalities.anatomical and self.config.modalities.gray_matter
         )
-        new_sessions = merged[merged["_merge"] == "left_only"].drop(columns=["_merge"])
+        needs_anatomical_wm = (
+            self.config.modalities.anatomical and self.config.modalities.white_matter
+        )
+        needs_anatomical_ct = (
+            self.config.modalities.anatomical
+            and self.config.modalities.cortical_thickness
+        )
+        needs_diffusion = self.config.modalities.diffusion
 
-        n_skipped = len(all_sessions) - len(new_sessions)
+        # Build filter conditions separately for anatomical and diffusion
+        needs_anatomical = pd.Series([False] * len(meta), index=meta.index)
 
-        if n_skipped > 0:
-            logger.info(
-                f"Incremental mode: {n_skipped} sessions already in store, "
-                f"{len(new_sessions)} new sessions to load"
+        if needs_anatomical_gm and "anatomical_gm_loaded" in meta.columns:
+            needs_anatomical |= ~meta["anatomical_gm_loaded"]
+        elif needs_anatomical_gm:
+            needs_anatomical |= True
+
+        if needs_anatomical_wm and "anatomical_wm_loaded" in meta.columns:
+            needs_anatomical |= ~meta["anatomical_wm_loaded"]
+        elif needs_anatomical_wm:
+            needs_anatomical |= True
+
+        if needs_anatomical_ct and "anatomical_ct_loaded" in meta.columns:
+            needs_anatomical |= ~meta["anatomical_ct_loaded"]
+        elif needs_anatomical_ct:
+            needs_anatomical |= True
+
+        needs_diffusion_loading = pd.Series([False] * len(meta), index=meta.index)
+        if needs_diffusion and "diffusion_loaded" in meta.columns:
+            needs_diffusion_loading |= ~meta["diffusion_loaded"]
+        elif needs_diffusion:
+            needs_diffusion_loading |= True
+
+        # Get sessions for each modality
+        anatomical_meta = meta[needs_anatomical].copy()
+        diffusion_sessions = meta[needs_diffusion_loading][
+            ["subject_code", "session_id"]
+        ]
+
+        # For anatomical sessions, determine which specific modalities each needs
+        if not anatomical_meta.empty:
+
+            def get_needed_modalities(row):
+                """Determine which modalities a session needs to load."""
+                needed = []
+                if needs_anatomical_gm and not row.get("anatomical_gm_loaded", False):
+                    needed.append("gm")
+                if needs_anatomical_wm and not row.get("anatomical_wm_loaded", False):
+                    needed.append("wm")
+                if needs_anatomical_ct and not row.get("anatomical_ct_loaded", False):
+                    needed.append("ct")
+                return needed if needed else None
+
+            anatomical_meta["_modalities_to_load"] = anatomical_meta.apply(
+                get_needed_modalities, axis=1
             )
 
-        return new_sessions, n_skipped
+        anatomical_sessions = anatomical_meta[
+            ["subject_code", "session_id", "_modalities_to_load"]
+        ]
+
+        # Merge with full sessions CSV to get all columns
+        anatomical_sessions = all_sessions.merge(
+            anatomical_sessions,
+            on=["subject_code", "session_id"],
+            how="inner",
+        )
+
+        diffusion_sessions = all_sessions.merge(
+            diffusion_sessions,
+            on=["subject_code", "session_id"],
+            how="inner",
+        )
+
+        # Count total unique sessions that need any loading
+        all_needed = pd.concat(
+            [
+                anatomical_sessions[["subject_code", "session_id"]],
+                diffusion_sessions[["subject_code", "session_id"]],
+            ]
+        ).drop_duplicates()
+
+        n_skipped = len(all_sessions) - len(all_needed)
+
+        if (
+            n_skipped > 0
+            or len(anatomical_sessions) < len(all_sessions)
+            or len(diffusion_sessions) < len(all_sessions)
+        ):
+            logger.info(
+                f"Incremental mode: {n_skipped} sessions fully loaded, "
+                f"{len(anatomical_sessions)} need anatomical, "
+                f"{len(diffusion_sessions)} need diffusion"
+            )
+
+            # Log per-modality breakdown for anatomical
+            if (
+                not anatomical_sessions.empty
+                and "_modalities_to_load" in anatomical_sessions.columns
+            ):
+                modality_counts = {}
+                for mods in anatomical_sessions["_modalities_to_load"]:
+                    if mods:
+                        for mod in mods:
+                            modality_counts[mod] = modality_counts.get(mod, 0) + 1
+                if modality_counts:
+                    breakdown = ", ".join(
+                        [
+                            f"{mod}: {count}"
+                            for mod, count in sorted(modality_counts.items())
+                        ]
+                    )
+                    logger.info(f"  Anatomical modalities needed: {breakdown}")
+
+        return all_sessions, anatomical_sessions, diffusion_sessions, n_skipped
 
     def _write_temp_sessions_csv(self, sessions_df: pd.DataFrame) -> Path:
         """Write a temporary sessions CSV for the loaders."""
@@ -196,22 +319,30 @@ class DataPreparationPipeline:
         # Create callback for incremental saving to SQLite
         def save_session(subject: str, session: str, df: pd.DataFrame) -> None:
             if store is None:
-                logger.debug(f"Store is None, skipping cache save for {subject}/{session}")
+                logger.debug(
+                    f"Store is None, skipping cache save for {subject}/{session}"
+                )
                 return
             if len(df) == 0:
-                logger.debug(f"Empty dataframe for {subject}/{session}, skipping cache save")
+                logger.debug(
+                    f"Empty dataframe for {subject}/{session}, skipping cache save"
+                )
                 return
 
             # Detect modality from the dataframe
-            if 'modality' in df.columns:
-                modalities = df['modality'].unique()
-                logger.debug(f"Saving {subject}/{session} to cache: modalities={modalities}")
+            if "modality" in df.columns:
+                modalities = df["modality"].unique()
+                logger.debug(
+                    f"Saving {subject}/{session} to cache: modalities={modalities}"
+                )
                 for modality in modalities:
-                    mod_df = df[df['modality'] == modality]
+                    mod_df = df[df["modality"] == modality]
                     store.append_anatomical_session(mod_df, subject, session, modality)
             else:
                 # If no modality column, save as-is (should not happen)
-                logger.warning(f"No modality column in {subject}/{session} - columns: {df.columns.tolist()}")
+                logger.warning(
+                    f"No modality column in {subject}/{session} - columns: {df.columns.tolist()}"
+                )
 
         logger.info(f"Loading anatomical data (n_jobs={self.config.n_jobs})...")
         try:
@@ -265,22 +396,30 @@ class DataPreparationPipeline:
         # Create callback for incremental saving to SQLite
         def save_session(subject: str, session: str, df: pd.DataFrame) -> None:
             if store is None:
-                logger.debug(f"Store is None, skipping cache save for {subject}/{session}")
+                logger.debug(
+                    f"Store is None, skipping cache save for {subject}/{session}"
+                )
                 return
             if len(df) == 0:
-                logger.debug(f"Empty dataframe for {subject}/{session}, skipping cache save")
+                logger.debug(
+                    f"Empty dataframe for {subject}/{session}, skipping cache save"
+                )
                 return
 
             # Detect workflow from the dataframe
-            if 'workflow' in df.columns:
-                workflows = df['workflow'].unique()
-                logger.debug(f"Saving {subject}/{session} to cache: workflows={workflows}")
+            if "workflow" in df.columns:
+                workflows = df["workflow"].unique()
+                logger.debug(
+                    f"Saving {subject}/{session} to cache: workflows={workflows}"
+                )
                 for workflow in workflows:
-                    wf_df = df[df['workflow'] == workflow]
+                    wf_df = df[df["workflow"] == workflow]
                     store.append_diffusion_session(wf_df, subject, session, workflow)
             else:
                 # If no workflow column, save all together
-                logger.debug(f"Saving {subject}/{session} to cache (no workflow column)")
+                logger.debug(
+                    f"Saving {subject}/{session} to cache (no workflow column)"
+                )
                 store.append_diffusion_session(df, subject, session, workflow=None)
 
         logger.info(f"Loading diffusion data (n_jobs={self.config.n_jobs})...")
@@ -432,11 +571,22 @@ class DataPreparationPipeline:
             compression=self.config.output.compression,
         )
 
-        # Determine which sessions to load
-        sessions_to_load, n_skipped = self._get_sessions_to_load(store)
+        # Initialize metadata with ALL sessions (tracking load status)
+        # Only initialize if metadata doesn't exist or force=True
+        all_sessions = self._load_sessions_csv()
+        if self.config.force or not store.metadata_path.exists():
+            logger.info("Initializing metadata with all sessions")
+            store.initialize_metadata(all_sessions, age_col=self.config.age_column)
+        else:
+            logger.info("Using existing metadata")
 
-        if sessions_to_load.empty:
-            logger.info("All sessions already in store - nothing to do")
+        # Determine which sessions to load (separate for anatomical and diffusion)
+        _, anatomical_sessions, diffusion_sessions, n_skipped = (
+            self._get_sessions_to_load(store)
+        )
+
+        if anatomical_sessions.empty and diffusion_sessions.empty:
+            logger.info("All sessions already loaded - nothing to do")
             metadata = self._compute_metadata(store)
             return PipelineResult(
                 store=store,
@@ -448,19 +598,33 @@ class DataPreparationPipeline:
                 n_skipped_sessions=n_skipped,
             )
 
-        # Prepare temp CSV if incremental
-        temp_csv = None
+        # Prepare temp CSVs for each modality if incremental
+        temp_anatomical_csv = None
+        temp_diffusion_csv = None
         is_incremental = not self.config.force and store.exists()
 
         if is_incremental:
-            temp_csv = self._write_temp_sessions_csv(sessions_to_load)
-            sessions_csv_path = temp_csv
-        else:
-            sessions_csv_path = None
+            if not anatomical_sessions.empty:
+                temp_anatomical_csv = self._write_temp_sessions_csv(anatomical_sessions)
+            if not diffusion_sessions.empty:
+                temp_dir = self.config.paths.output_dir / ".tmp"
+                temp_dir.mkdir(parents=True, exist_ok=True)
+                temp_diffusion_csv = temp_dir / "sessions_to_load_diffusion.csv"
+                diffusion_sessions.to_csv(temp_diffusion_csv, index=False)
 
-        n_new_sessions = len(
-            sessions_to_load[["subject_code", "session_id"]].drop_duplicates()
+        # Calculate total new sessions
+        all_needed = (
+            pd.concat(
+                [
+                    anatomical_sessions[["subject_code", "session_id"]],
+                    diffusion_sessions[["subject_code", "session_id"]],
+                ]
+            ).drop_duplicates()
+            if not anatomical_sessions.empty or not diffusion_sessions.empty
+            else pd.DataFrame()
         )
+
+        n_new_sessions = len(all_needed)
 
         long_formats_saved = []
         tiv_df = None
@@ -474,19 +638,27 @@ class DataPreparationPipeline:
         with ThreadPoolExecutor(max_workers=2) as executor:
             futures = {}
 
-            if self.config.modalities.anatomical:
+            # Only load anatomical if there are sessions that need it
+            if self.config.modalities.anatomical and not anatomical_sessions.empty:
+                anatomical_csv = temp_anatomical_csv if temp_anatomical_csv else None
                 futures["anatomical"] = executor.submit(
                     self.load_anatomical_data,
-                    sessions_csv_path,
+                    anatomical_csv,
                     store,  # Pass store for incremental saving
                 )
+            elif self.config.modalities.anatomical:
+                logger.info("All anatomical sessions already loaded - skipping")
 
-            if self.config.modalities.diffusion:
+            # Only load diffusion if there are sessions that need it
+            if self.config.modalities.diffusion and not diffusion_sessions.empty:
+                diffusion_csv = temp_diffusion_csv if temp_diffusion_csv else None
                 futures["diffusion"] = executor.submit(
                     self.load_diffusion_data,
-                    sessions_csv_path,
+                    diffusion_csv,
                     store,  # Pass store for incremental saving
                 )
+            elif self.config.modalities.diffusion:
+                logger.info("All diffusion sessions already loaded - skipping")
 
             # Collect results
             for name, future in futures.items():
@@ -503,7 +675,9 @@ class DataPreparationPipeline:
         # Export cache to Parquet files
         # =====================================================================
         logger.info("Exporting cached data to Parquet files...")
-        long_formats_saved = store.export_cache_to_parquet(atlas_name=self.config.atlas_name)
+        long_formats_saved = store.export_cache_to_parquet(
+            atlas_name=self.config.atlas_name
+        )
 
         # Extract TIV from anatomical data if available
         if anatomical_df is not None and len(anatomical_df) > 0:
@@ -522,14 +696,18 @@ class DataPreparationPipeline:
                 name = store.save_diffusion_long(wf_df, workflow=workflow)
                 long_formats_saved.append(name)
 
-        # Clean up temp file
-        if temp_csv and temp_csv.exists():
-            temp_csv.unlink()
-            if temp_csv.parent.exists():
-                try:
-                    temp_csv.parent.rmdir()
-                except OSError:
-                    pass
+        # Clean up temp files
+        for temp_csv in [temp_anatomical_csv, temp_diffusion_csv]:
+            if temp_csv and temp_csv.exists():
+                temp_csv.unlink()
+
+        # Clean up temp directory if empty
+        temp_dir = self.config.paths.output_dir / ".tmp"
+        if temp_dir.exists():
+            try:
+                temp_dir.rmdir()
+            except OSError:
+                pass  # Directory not empty or other issue
 
         if not long_formats_saved:
             raise ValueError("No data was saved - check your data paths")
@@ -543,11 +721,9 @@ class DataPreparationPipeline:
             tiv_feature_name = store.save_tiv(tiv_df)
 
         # =====================================================================
-        # Save metadata
+        # Metadata is already saved incrementally via update_session_load_status()
+        # No need to save again here
         # =====================================================================
-        logger.info("Saving metadata...")
-        metadata_df = self._prepare_metadata_df(anatomical_df, diffusion_df)
-        store.save_metadata(metadata_df, age_col=self.config.age_column)
 
         # =====================================================================
         # Generate wide-format features

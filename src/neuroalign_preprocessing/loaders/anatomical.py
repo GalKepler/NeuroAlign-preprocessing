@@ -223,6 +223,7 @@ class AnatomicalLoader:
         session: str,
         include_metadata: bool = True,
         include_tiv: bool = True,
+        modalities: Optional[List[str]] = None,
     ) -> Optional[pd.DataFrame]:
         """
         Load pre-parcellated TSVs for a single session.
@@ -232,6 +233,7 @@ class AnatomicalLoader:
             session: Session ID (without 'ses-' prefix)
             include_metadata: Whether to include subject/session columns
             include_tiv: Whether to extract and include TIV
+            modalities: List of modalities to load (e.g., ["gm", "wm"]). If None, loads all.
 
         Returns:
             DataFrame with regional features or None if session not found
@@ -248,6 +250,14 @@ class AnatomicalLoader:
             "WM": ("wm", "volume"),
             "CT": ("ct", "thickness"),
         }
+
+        # Filter to requested modalities
+        if modalities is not None:
+            tissue_config = {
+                tissue: (mod, metric)
+                for tissue, (mod, metric) in tissue_config.items()
+                if mod in modalities
+            }
 
         for tissue, (modality, metric) in tissue_config.items():
             tsv_files = list(session_dir.glob(f"*_tissue-{tissue}_parc.tsv"))
@@ -279,6 +289,7 @@ class AnatomicalLoader:
         self,
         row: Dict[str, Any],
         include_tiv: bool,
+        modalities: Optional[List[str]] = None,
     ) -> Tuple[str, str, Optional[pd.DataFrame]]:
         """
         Worker function for parallel session loading.
@@ -286,6 +297,7 @@ class AnatomicalLoader:
         Args:
             row: Dictionary with session metadata (subject_code, session_id, etc.)
             include_tiv: Whether to extract and include TIV
+            modalities: List of modalities to load (e.g., ["gm", "wm"]). If None, loads all.
 
         Returns:
             Tuple of (subject_code, session_id, DataFrame or None)
@@ -293,17 +305,21 @@ class AnatomicalLoader:
         subject = row["subject_code"]
         session = row["session_id"]
 
+        # Check if row specifies which modalities to load for this session
+        session_modalities = row.get("_modalities_to_load", modalities)
+
         session_data = self.load_session(
             subject=subject,
             session=session,
             include_metadata=True,
             include_tiv=include_tiv,
+            modalities=session_modalities,
         )
 
         if session_data is not None:
             # Add metadata columns from sessions CSV
             for col, val in row.items():
-                if col not in session_data.columns:
+                if col not in session_data.columns and not col.startswith("_"):
                     session_data[col] = val
 
         return subject, session, session_data
@@ -318,6 +334,7 @@ class AnatomicalLoader:
         tiv_output_dir: Optional[Path] = None,  # Kept for API compatibility, not used
         calculate_tiv: bool = True,
         session_callback: Optional[Callable[[str, str, pd.DataFrame], None]] = None,
+        modalities: Optional[List[str]] = None,
     ) -> pd.DataFrame:
         """
         Load anatomical data for multiple sessions.
@@ -333,6 +350,8 @@ class AnatomicalLoader:
             tiv_output_dir: Kept for API compatibility (not used - TIV from XML)
             calculate_tiv: Whether to extract TIV from XML files
             session_callback: Optional callback(subject, session, df) called after each session loads
+            modalities: List of modalities to load (e.g., ["gm", "wm"]). If None, loads all.
+                       Can also be specified per-session via '_modalities_to_load' column in CSV.
 
         Returns:
             DataFrame with all sessions' regional features
@@ -343,10 +362,10 @@ class AnatomicalLoader:
         effective_jobs = n_jobs if n_jobs is not None else self.n_jobs
 
         if effective_jobs == 1:
-            df = self._load_sessions_serial(sessions, progress, calculate_tiv, session_callback)
+            df = self._load_sessions_serial(sessions, progress, calculate_tiv, session_callback, modalities)
         else:
             df = self._load_sessions_parallel(
-                sessions, progress, effective_jobs, calculate_tiv, session_callback
+                sessions, progress, effective_jobs, calculate_tiv, session_callback, modalities
             )
 
         # Optionally normalize volume columns by TIV
@@ -369,6 +388,7 @@ class AnatomicalLoader:
         progress: bool,
         include_tiv: bool,
         session_callback: Optional[Callable[[str, str, pd.DataFrame], None]] = None,
+        modalities: Optional[List[str]] = None,
     ) -> pd.DataFrame:
         """
         Serial loading.
@@ -378,6 +398,7 @@ class AnatomicalLoader:
             progress: Whether to show progress bar
             include_tiv: Whether to extract TIV
             session_callback: Optional callback(subject, session, df) called after each session
+            modalities: List of modalities to load. If None, loads all.
 
         Returns:
             DataFrame with all sessions' regional features
@@ -399,17 +420,21 @@ class AnatomicalLoader:
             subject = row["subject_code"]
             session = row["session_id"]
 
+            # Check if session has specific modalities to load
+            session_modalities = row.get("_modalities_to_load", modalities)
+
             session_data = self.load_session(
                 subject=subject,
                 session=session,
                 include_metadata=True,
                 include_tiv=include_tiv,
+                modalities=session_modalities,
             )
 
             if session_data is not None:
                 # Add metadata columns from sessions CSV
                 for col in sessions.columns:
-                    if col not in session_data.columns:
+                    if col not in session_data.columns and not col.startswith("_"):
                         session_data[col] = row[col]
 
                 # Call callback if provided
@@ -433,6 +458,7 @@ class AnatomicalLoader:
         n_jobs: int,
         include_tiv: bool,
         session_callback: Optional[Callable[[str, str, pd.DataFrame], None]] = None,
+        modalities: Optional[List[str]] = None,
     ) -> pd.DataFrame:
         """
         Parallel loading using ThreadPoolExecutor.
@@ -444,6 +470,8 @@ class AnatomicalLoader:
             progress: Whether to show progress bar
             n_jobs: Number of parallel workers
             include_tiv: Whether to extract TIV
+            session_callback: Optional callback for each session
+            modalities: List of modalities to load. If None, loads all.
 
         Returns:
             DataFrame with all sessions' regional features
@@ -463,6 +491,7 @@ class AnatomicalLoader:
                     self._load_session_worker,
                     row.to_dict(),
                     include_tiv,
+                    modalities,
                 )
                 for _, row in sessions.iterrows()
             ]

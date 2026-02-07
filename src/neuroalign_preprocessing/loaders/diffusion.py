@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from neuroalign_preprocessing.utils.sessions import sanitize_subject_code, sanitize_session_id
 import pandas as pd
 
 logger = logging.getLogger(__name__)
@@ -221,11 +222,6 @@ class DiffusionLoader:
             session=session,
             workflow=workflow,
         )
-        if session_data is not None:
-            # Add metadata columns from sessions CSV
-            for col, val in row.items():
-                if col not in session_data.columns:
-                    session_data[col] = val
         return subject, session, session_data
 
     def load_sessions(
@@ -249,13 +245,20 @@ class DiffusionLoader:
         Returns:
             DataFrame with all sessions' regional features
         """
-        sessions = pd.read_csv(sessions_csv, dtype={"subject_code": str, "session_id": str})
+        sessions = pd.read_csv(sessions_csv)
+        # Sanitize subject codes and session IDs
+        sessions["subject_code"] = sessions["subject_code"].apply(sanitize_subject_code)
+        sessions["session_id"] = sessions["session_id"].apply(sanitize_session_id)
+        for col in sessions.select_dtypes(include=["object"]).columns:
+            sessions[col] = sessions[col].str.strip()
         effective_jobs = n_jobs if n_jobs is not None else self.n_jobs
 
         if effective_jobs == 1:
             return self._load_sessions_serial(sessions, workflow, progress, session_callback)
         else:
-            return self._load_sessions_parallel(sessions, workflow, progress, effective_jobs, session_callback)
+            return self._load_sessions_parallel(
+                sessions, workflow, progress, effective_jobs, session_callback
+            )
 
     def _load_sessions_serial(
         self,
@@ -290,14 +293,8 @@ class DiffusionLoader:
         for _, row in iterator:
             subject = row["subject_code"]
             session = row["session_id"]
-            session_data = self.load_session(
-                subject=subject, session=session, workflow=workflow
-            )
+            session_data = self.load_session(subject=subject, session=session, workflow=workflow)
             if session_data is not None:
-                for col in sessions.columns:
-                    if col not in session_data.columns:
-                        session_data[col] = row[col]
-
                 # Call callback if provided
                 if session_callback is not None:
                     try:
@@ -305,10 +302,15 @@ class DiffusionLoader:
                     except Exception as e:
                         logger.warning(f"Session callback failed for {subject}/{session}: {e}")
 
-                results.append(session_data)
+                # Only accumulate in memory if no callback is persisting data
+                if session_callback is None:
+                    results.append(session_data)
 
-        if not results:
+        if not results and session_callback is None:
             raise ValueError("No sessions successfully loaded")
+
+        if session_callback is not None:
+            return pd.DataFrame()
 
         return pd.concat(results, ignore_index=True, copy=False)
 
@@ -373,9 +375,13 @@ class DiffusionLoader:
                             try:
                                 session_callback(subject, session, session_data)
                             except Exception as e:
-                                logger.warning(f"Session callback failed for {subject}/{session}: {e}")
+                                logger.warning(
+                                    f"Session callback failed for {subject}/{session}: {e}"
+                                )
 
-                        results.append(session_data)
+                        # Only accumulate in memory if no callback is persisting data
+                        if session_callback is None:
+                            results.append(session_data)
                         success_count += 1
                         logger.debug(f"  SUCCESS: sub-{subject}_ses-{session}")
                     else:
@@ -399,13 +405,18 @@ class DiffusionLoader:
             if len(failed_sessions) > 50:
                 logger.debug(f"  ... and {len(failed_sessions) - 50} more")
 
-        if not results:
+        if success_count == 0:
             logger.error(
                 f"No sessions successfully loaded. "
                 f"Attempted {len(sessions)} sessions. "
                 f"Success: {success_count}, Skipped: {skip_count}, Errors: {error_count}"
             )
             raise ValueError("No sessions successfully loaded")
+
+        # When callback was used, data is already persisted - return empty DataFrame
+        if session_callback is not None:
+            logger.info(f"Successfully loaded and saved {success_count} sessions via callback")
+            return pd.DataFrame()
 
         logger.info(f"Successfully loaded {len(results)} sessions")
         return pd.concat(results, ignore_index=True, copy=False)

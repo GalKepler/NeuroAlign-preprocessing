@@ -79,7 +79,9 @@ Example:
     # Check if cache exists
     if not store.has_cache():
         logger.error(f"No cache found in {args.output_dir}")
-        logger.info("Cache is created during pipeline runs and contains partially loaded data")
+        logger.info(
+            "Cache is created during pipeline runs and contains partially loaded data"
+        )
         return 1
 
     # Show status
@@ -88,11 +90,11 @@ Example:
     print("CACHE STATUS")
     print("=" * 60)
     print(f"Location: {store.cache_db_path}")
-    print(f"Size: {status['size_mb']:.2f} MB")
+    print(f"Size: {status['size_mb'] / 1024:.2f} GB")
     print(f"Anatomical sessions: {status['n_sessions_anatomical']}")
     print(f"Diffusion sessions: {status['n_sessions_diffusion']}")
     print(f"\nTables: {len(status['tables'])}")
-    for table in status['tables']:
+    for table in status["tables"]:
         print(f"  - {table}")
     print("=" * 60)
 
@@ -104,9 +106,17 @@ Example:
     try:
         long_formats = store.export_cache_to_parquet(atlas_name=args.atlas_name)
 
+        # Check for partial failures
+        failed_tables = store.get_export_failures()
+
         print(f"\n✓ Exported {len(long_formats)} long formats:")
         for fmt in long_formats:
             print(f"  - {fmt}")
+
+        if failed_tables:
+            print(f"\n⚠ Warning: {len(failed_tables)} tables failed to export:")
+            for table, error in failed_tables:
+                print(f"  - {table}: {error}")
 
         # Generate wide features
         print("\nGenerating wide-format features...")
@@ -125,6 +135,9 @@ Example:
         print(f"  store = FeatureStore('{args.output_dir}')")
         print("  features = store.list_features()")
 
+        # Return non-zero exit code if there were failures
+        if failed_tables:
+            return 2  # Partial success
         return 0
 
     except Exception as e:

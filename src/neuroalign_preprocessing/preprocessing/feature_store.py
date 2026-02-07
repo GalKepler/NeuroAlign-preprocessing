@@ -12,7 +12,13 @@ Structure:
     │   ├── anatomical_wm.parquet
     │   ├── anatomical_ct.parquet
     │   └── diffusion/
-    │       ├── AMICONODDI.parquet
+    │       ├── AMICONODDI/
+    │       │   ├── icvf.parquet
+    │       │   ├── isovf.parquet
+    │       │   └── od.parquet
+    │       ├── DSIStudio/
+    │       │   ├── QA.parquet
+    │       │   └── GFA.parquet
     │       └── ...
     ├── wide/
     │   ├── anatomical/
@@ -31,8 +37,10 @@ Example:
     ['gm_volume_mm3', 'gm_mean', 'ct_mean', ...]
     >>> gm_vol = store.load_feature("gm_volume_mm3")
     >>> gm_long = store.load_long("anatomical_gm")
+    >>> diff_long = store.load_long("diffusion_AMICONODDI_icvf")
 """
 
+import gc
 import json
 import logging
 import sqlite3
@@ -44,6 +52,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Set, Tuple, Union
 
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 logger = logging.getLogger(__name__)
 
@@ -78,6 +88,16 @@ REGION_ID_COLS = [
 ]
 # Metadata columns
 META_COLS = ["subject_code", "session_id"]
+
+# Columns allowed in the SQLite cache (everything else is metadata bloat)
+ANATOMICAL_CACHE_COLS = set(
+    META_COLS + REGION_ID_COLS + ANATOMICAL_METRICS
+    + ["modality", "metric", "tiv", "atlas_name"]
+)
+DIFFUSION_CACHE_COLS = set(
+    META_COLS + REGION_ID_COLS + DIFFUSION_METRICS
+    + ["workflow", "model", "param", "desc", "atlas_name", "name"]
+)
 
 
 @dataclass
@@ -239,6 +259,7 @@ class FeatureStore:
         self.root_dir = Path(root_dir)
         self.compression = compression
         self._manifest: Optional[StoreManifest] = None
+        self._cache_initialized = False
 
         # Get or create a lock for this specific cache path
         cache_path_str = str(self.cache_db_path)
@@ -246,6 +267,13 @@ class FeatureStore:
             if cache_path_str not in FeatureStore._cache_locks:
                 FeatureStore._cache_locks[cache_path_str] = threading.Lock()
             self._cache_lock = FeatureStore._cache_locks[cache_path_str]
+
+        # Batched metadata updates (reduces disk I/O)
+        self._pending_metadata_updates: List[Tuple[str, str, str, bool]] = []
+        self._metadata_update_lock = threading.Lock()
+
+        # Track export failures for reporting
+        self._export_failures: List[Tuple[str, str]] = []
 
     # -------------------------------------------------------------------------
     # Directory structure
@@ -327,33 +355,48 @@ class FeatureStore:
     # -------------------------------------------------------------------------
 
     def _init_cache_db(self) -> None:
-        """Initialize SQLite database for incremental saving with WAL mode."""
+        """Initialize SQLite database for incremental saving with WAL mode.
+
+        Must be called while self._cache_lock is already held (via
+        _ensure_cache_initialized).  Does NOT acquire the lock itself to
+        avoid deadlocking on the non-reentrant threading.Lock.
+        """
         self._ensure_dirs()
 
+        conn = sqlite3.connect(self.cache_db_path, timeout=60.0)
+        cursor = conn.cursor()
+
+        # Enable WAL mode for better concurrent access
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.execute("PRAGMA synchronous=NORMAL")  # Faster, still crash-safe
+        cursor.execute("PRAGMA cache_size=-64000")  # 64MB cache
+        cursor.execute("PRAGMA busy_timeout=60000")  # 60 second timeout
+
+        # Simple table to track completed sessions
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS completed_sessions (
+                subject_code TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                modality TEXT NOT NULL,
+                completed_at TEXT NOT NULL,
+                PRIMARY KEY (subject_code, session_id, modality)
+            )
+        """)
+
+        conn.commit()
+        conn.close()
+        logger.debug(f"Initialized cache database: {self.cache_db_path} (WAL mode)")
+
+    def _ensure_cache_initialized(self) -> None:
+        """Thread-safe cache initialization (double-checked locking)."""
+        if self._cache_initialized:
+            return
         with self._cache_lock:
-            conn = sqlite3.connect(self.cache_db_path, timeout=60.0)
-            cursor = conn.cursor()
-
-            # Enable WAL mode for better concurrent access
-            cursor.execute("PRAGMA journal_mode=WAL")
-            cursor.execute("PRAGMA synchronous=NORMAL")  # Faster, still crash-safe
-            cursor.execute("PRAGMA cache_size=-64000")  # 64MB cache
-            cursor.execute("PRAGMA busy_timeout=60000")  # 60 second timeout
-
-            # Simple table to track completed sessions
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS completed_sessions (
-                    subject_code TEXT NOT NULL,
-                    session_id TEXT NOT NULL,
-                    modality TEXT NOT NULL,
-                    completed_at TEXT NOT NULL,
-                    PRIMARY KEY (subject_code, session_id, modality)
-                )
-            """)
-
-            conn.commit()
-            conn.close()
-            logger.debug(f"Initialized cache database: {self.cache_db_path} (WAL mode)")
+            if not self._cache_initialized:
+                if not self.cache_db_path.exists():
+                    logger.info(f"Initializing cache database at: {self.cache_db_path}")
+                    self._init_cache_db()
+                self._cache_initialized = True
 
     def get_cached_sessions(self, modality: str = "anatomical") -> Set[Tuple[str, str]]:
         """
@@ -396,9 +439,8 @@ class FeatureStore:
         """
         logger.debug(f"append_anatomical_session called: {subject_code}/{session_id} ({modality}), {len(df)} rows")
 
-        if not self.cache_db_path.exists():
-            logger.info(f"Initializing cache database at: {self.cache_db_path}")
-            self._init_cache_db()
+        # Thread-safe cache initialization
+        self._ensure_cache_initialized()
 
         # Prepare data outside of lock
         df_copy = df.copy()
@@ -406,6 +448,11 @@ class FeatureStore:
             df_copy['subject_code'] = subject_code
         if 'session_id' not in df_copy.columns:
             df_copy['session_id'] = session_id
+
+        # Filter to allowed columns to avoid storing CSV metadata bloat
+        keep_cols = [c for c in df_copy.columns if c in ANATOMICAL_CACHE_COLS]
+        if keep_cols:
+            df_copy = df_copy[keep_cols]
 
         table_name = f"anatomical_{modality}"
 
@@ -431,8 +478,8 @@ class FeatureStore:
                     conn.close()
                     logger.info(f"✓ Cached {modality}: {subject_code}/{session_id}")
 
-                    # Update metadata load status
-                    self.update_session_load_status(subject_code, session_id, modality, loaded=True)
+                    # Queue metadata update (batched, no immediate disk write)
+                    self.queue_session_load_status(subject_code, session_id, modality, loaded=True)
                     break
 
                 except sqlite3.OperationalError as e:
@@ -463,8 +510,8 @@ class FeatureStore:
             session_id: Session identifier
             workflow: Workflow name (if None, uses workflow column from df)
         """
-        if not self.cache_db_path.exists():
-            self._init_cache_db()
+        # Thread-safe cache initialization
+        self._ensure_cache_initialized()
 
         # Prepare data outside of lock
         df_copy = df.copy()
@@ -472,6 +519,11 @@ class FeatureStore:
             df_copy['subject_code'] = subject_code
         if 'session_id' not in df_copy.columns:
             df_copy['session_id'] = session_id
+
+        # Filter to allowed columns to avoid storing CSV metadata bloat
+        keep_cols = [c for c in df_copy.columns if c in DIFFUSION_CACHE_COLS]
+        if keep_cols:
+            df_copy = df_copy[keep_cols]
 
         # Determine workflows
         if workflow:
@@ -481,14 +533,22 @@ class FeatureStore:
         else:
             workflows = ['unknown']
 
-        # Prepare workflow dataframes outside lock
-        workflow_dfs = []
+        # Prepare per-workflow, per-param dataframes outside lock
+        workflow_param_dfs = []
         for wf in workflows:
             if 'workflow' in df_copy.columns:
-                wf_df = df_copy[df_copy['workflow'] == wf].copy()
+                wf_df = df_copy[df_copy['workflow'] == wf]
             else:
-                wf_df = df_copy.copy()
-            workflow_dfs.append((wf, wf_df))
+                wf_df = df_copy
+
+            # Split by param within each workflow
+            if 'param' in wf_df.columns:
+                for param_val in wf_df['param'].unique():
+                    param_df = wf_df[wf_df['param'] == param_val].copy()
+                    p = str(param_val) if param_val else "unknown"
+                    workflow_param_dfs.append((wf, p, param_df))
+            else:
+                workflow_param_dfs.append((wf, "unknown", wf_df.copy()))
 
         # Use lock to serialize writes
         with self._cache_lock:
@@ -497,10 +557,10 @@ class FeatureStore:
                 try:
                     conn = sqlite3.connect(self.cache_db_path, timeout=60.0)
 
-                    # Write each workflow
-                    for wf, wf_df in workflow_dfs:
-                        table_name = f"diffusion_{wf}"
-                        wf_df.to_sql(table_name, conn, if_exists='append', index=False)
+                    # Write each workflow+param combination
+                    for wf, param, wf_param_df in workflow_param_dfs:
+                        table_name = f"diffusion__{wf}__{param}"
+                        wf_param_df.to_sql(table_name, conn, if_exists='append', index=False)
 
                     # Mark session as completed
                     cursor = conn.cursor()
@@ -513,8 +573,8 @@ class FeatureStore:
                     conn.close()
                     logger.info(f"✓ Cached diffusion: {subject_code}/{session_id}")
 
-                    # Update metadata load status
-                    self.update_session_load_status(subject_code, session_id, "diffusion", loaded=True)
+                    # Queue metadata update (batched, no immediate disk write)
+                    self.queue_session_load_status(subject_code, session_id, "diffusion", loaded=True)
                     break
 
                 except sqlite3.OperationalError as e:
@@ -529,9 +589,33 @@ class FeatureStore:
                         logger.error(f"Failed to cache {subject_code}/{session_id} after {max_retries} attempts: {e}")
                         raise
 
+    def _get_allowed_columns(self, table_name: str, conn: sqlite3.Connection) -> Optional[List[str]]:
+        """
+        Intersect the cache column allowlist with actual table columns.
+
+        Returns a list of column names to SELECT, or None to fall back to SELECT *.
+        """
+        cursor = conn.cursor()
+        cursor.execute(f'PRAGMA table_info("{table_name}")')
+        actual_cols = {row[1] for row in cursor.fetchall()}
+
+        if table_name.startswith("anatomical_"):
+            allowed = ANATOMICAL_CACHE_COLS & actual_cols
+        elif table_name.startswith("diffusion_"):
+            allowed = DIFFUSION_CACHE_COLS & actual_cols
+        else:
+            return None
+
+        if not allowed:
+            return None  # fall back to SELECT *
+
+        return sorted(allowed)
+
     def export_cache_to_parquet(self, atlas_name: str = "") -> List[str]:
         """
         Export SQLite cache to Parquet files and update manifest.
+
+        Uses chunked streaming to avoid loading entire tables into memory.
 
         Args:
             atlas_name: Name of atlas used (for metadata)
@@ -543,7 +627,15 @@ class FeatureStore:
             logger.warning("No cache database found - nothing to export")
             return []
 
-        logger.info("Exporting cache to Parquet files...")
+        # Clear previous export failures
+        self._export_failures = []
+
+        self._ensure_dirs()
+        manifest = self._load_manifest()
+        if atlas_name:
+            manifest.atlas_name = atlas_name
+
+        logger.info("Exporting cache to Parquet files (chunked streaming)...")
         conn = sqlite3.connect(self.cache_db_path)
         cursor = conn.cursor()
         long_formats_saved = []
@@ -552,31 +644,131 @@ class FeatureStore:
         cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
         tables = [row[0] for row in cursor.fetchall() if row[0] != 'completed_sessions']
 
+        chunksize = 50_000
+
         for table_name in tables:
             try:
-                df = pd.read_sql(f"SELECT * FROM {table_name}", conn)
-                if len(df) == 0:
+                # Determine output path and metadata
+                if table_name.startswith("anatomical_"):
+                    modality_or_workflow = table_name.replace("anatomical_", "")
+                    name = f"anatomical_{modality_or_workflow}"
+                    file_path = self.long_dir / f"{name}.parquet"
+                    modality_type = "anatomical"
+                    metrics_reference = ANATOMICAL_METRICS
+                elif "__" in table_name and table_name.startswith("diffusion__"):
+                    # New format: diffusion__{workflow}__{param}
+                    parts = table_name.split("__")
+                    wf = parts[1]
+                    param = parts[2] if len(parts) > 2 else "unknown"
+                    name = f"diffusion_{wf}_{param}"
+                    wf_dir = self.diffusion_long_dir / wf
+                    wf_dir.mkdir(parents=True, exist_ok=True)
+                    file_path = wf_dir / f"{param}.parquet"
+                    modality_type = "diffusion"
+                    metrics_reference = DIFFUSION_METRICS
+                elif table_name.startswith("diffusion_"):
+                    # Backward-compat: old format diffusion_{workflow} (single underscore)
+                    logger.warning(
+                        f"Old-format cache table '{table_name}' detected. "
+                        "Re-run the pipeline with a fresh cache for per-param splitting."
+                    )
+                    modality_or_workflow = table_name.replace("diffusion_", "")
+                    name = f"diffusion_{modality_or_workflow}"
+                    file_path = self.diffusion_long_dir / f"{modality_or_workflow}.parquet"
+                    modality_type = "diffusion"
+                    metrics_reference = DIFFUSION_METRICS
+                else:
                     continue
 
-                # Determine if anatomical or diffusion
-                if table_name.startswith("anatomical_"):
-                    modality = table_name.replace("anatomical_", "")
-                    name = self.save_anatomical_long(df, modality=modality, atlas_name=atlas_name)
-                    long_formats_saved.append(name)
-                    logger.info(f"Exported anatomical {modality}: {len(df)} rows")
+                # Select only allowed columns
+                allowed_cols = self._get_allowed_columns(table_name, conn)
+                if allowed_cols:
+                    col_list = ", ".join(f'"{c}"' for c in allowed_cols)
+                    sql = f'SELECT {col_list} FROM "{table_name}"'
+                else:
+                    sql = f'SELECT * FROM "{table_name}"'
 
-                elif table_name.startswith("diffusion_"):
-                    workflow = table_name.replace("diffusion_", "")
-                    name = self.save_diffusion_long(df, workflow=workflow)
-                    long_formats_saved.append(name)
-                    logger.info(f"Exported diffusion {workflow}: {len(df)} rows")
+                # Stream chunks and write incrementally via PyArrow
+                writer = None
+                n_rows = 0
+                sessions_seen: set = set()
+                columns_seen: Optional[List[str]] = None
+                metrics_found: set = set()
+
+                for chunk in pd.read_sql(sql, conn, chunksize=chunksize, coerce_float=False):
+                    if len(chunk) == 0:
+                        continue
+
+                    # Track manifest metadata incrementally
+                    n_rows += len(chunk)
+                    if columns_seen is None:
+                        columns_seen = chunk.columns.tolist()
+                        metrics_found = {c for c in columns_seen if c in metrics_reference}
+
+                    if "subject_code" in chunk.columns and "session_id" in chunk.columns:
+                        for pair in chunk[["subject_code", "session_id"]].drop_duplicates().itertuples(index=False):
+                            sessions_seen.add((pair.subject_code, pair.session_id))
+
+                    # Convert chunk to Arrow table and write
+                    arrow_table = pa.Table.from_pandas(chunk, preserve_index=False)
+                    if writer is None:
+                        writer = pq.ParquetWriter(
+                            str(file_path),
+                            arrow_table.schema,
+                            compression=self.compression or "snappy",
+                        )
+                    writer.write_table(arrow_table)
+
+                    del chunk, arrow_table
+
+                if writer is not None:
+                    writer.close()
+
+                if n_rows == 0:
+                    continue
+
+                # Update manifest with incrementally computed metadata
+                n_sessions = len(sessions_seen)
+                n_subjects = len({s[0] for s in sessions_seen})
+
+                info = LongFormatInfo(
+                    name=name,
+                    modality=modality_type,
+                    n_rows=n_rows,
+                    n_sessions=n_sessions,
+                    columns=columns_seen or [],
+                    metrics_available=sorted(metrics_found),
+                    file_path=str(file_path.relative_to(self.root_dir)),
+                    created_at=datetime.now().isoformat(),
+                )
+                manifest.add_long_format(info)
+                manifest.n_sessions = max(manifest.n_sessions, n_sessions)
+                manifest.n_subjects = max(manifest.n_subjects, n_subjects)
+
+                long_formats_saved.append(name)
+                logger.info(f"Exported {name}: {n_rows} rows, {n_sessions} sessions")
+
+                gc.collect()
 
             except Exception as e:
                 logger.error(f"Failed to export table {table_name}: {e}")
+                self._export_failures.append((table_name, str(e)))
 
         conn.close()
+        self._save_manifest()
         logger.info(f"Exported {len(long_formats_saved)} long formats from cache")
+        if self._export_failures:
+            logger.warning(f"{len(self._export_failures)} tables failed to export")
         return long_formats_saved
+
+    def get_export_failures(self) -> List[Tuple[str, str]]:
+        """
+        Get list of tables that failed to export in the last export_cache_to_parquet() call.
+
+        Returns:
+            List of (table_name, error_message) tuples
+        """
+        return self._export_failures.copy()
 
     def clear_cache(self) -> None:
         """Delete the SQLite cache database and associated WAL files."""
@@ -605,6 +797,8 @@ class FeatureStore:
                     except Exception as e:
                         logger.debug(f"Failed to delete {wal_file}: {e}")
 
+            # Allow re-initialization on next use
+            self._cache_initialized = False
             logger.info("Cleared cache database")
 
     def has_cache(self) -> bool:
@@ -659,12 +853,59 @@ class FeatureStore:
             "size_mb": round(size_mb, 2),
         }
 
+    def _resolve_diffusion_cache_table(
+        self, manifest_name: str, conn: sqlite3.Connection,
+    ) -> Optional[str]:
+        """
+        Translate a manifest-style diffusion name to the actual SQLite table name.
+
+        Manifest names look like ``diffusion_WF_P`` (single underscores) while
+        cache tables use ``diffusion__WF__P`` (double underscores).  Because
+        workflow names can themselves contain underscores (e.g.
+        ``MRtrix3_act-HSVS``), we scan the actual tables in the database to
+        find the match.
+
+        Args:
+            manifest_name: e.g. "diffusion_AMICONODDI_icvf"
+            conn: Open SQLite connection
+
+        Returns:
+            Actual table name or None
+        """
+        cursor = conn.cursor()
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        all_tables = [r[0] for r in cursor.fetchall()]
+
+        # Check for exact match first (old format or already correct)
+        if manifest_name in all_tables:
+            return manifest_name
+
+        # Try direct translation: diffusion_WF_P -> diffusion__WF__P
+        suffix = manifest_name.removeprefix("diffusion_")
+        # Build candidates from actual tables and see which one matches
+        for tbl in all_tables:
+            if not tbl.startswith("diffusion__"):
+                continue
+            parts = tbl.split("__")
+            if len(parts) >= 3:
+                wf = parts[1]
+                param = parts[2]
+                # The manifest name for this table would be diffusion_{wf}_{param}
+                candidate_manifest = f"diffusion_{wf}_{param}"
+                if candidate_manifest == manifest_name:
+                    return tbl
+
+        return None
+
     def load_from_cache(self, table_name: str) -> Optional[pd.DataFrame]:
         """
         Load data from SQLite cache table.
 
+        Handles both old-format table names (``diffusion_WF``) and new-format
+        manifest names (``diffusion_WF_P`` -> ``diffusion__WF__P``).
+
         Args:
-            table_name: Table name (e.g., "anatomical_gm", "diffusion_AMICONODDI")
+            table_name: Table name (e.g., "anatomical_gm", "diffusion_AMICONODDI_icvf")
 
         Returns:
             DataFrame or None if table doesn't exist
@@ -674,9 +915,19 @@ class FeatureStore:
 
         try:
             conn = sqlite3.connect(self.cache_db_path)
-            df = pd.read_sql(f"SELECT * FROM {table_name}", conn)
+
+            # Resolve diffusion manifest names to actual SQLite table names
+            actual_table = table_name
+            if table_name.startswith("diffusion_") and "__" not in table_name:
+                resolved = self._resolve_diffusion_cache_table(table_name, conn)
+                if resolved is not None:
+                    actual_table = resolved
+
+            df = pd.read_sql(
+                f'SELECT * FROM "{actual_table}"', conn, coerce_float=False,
+            )
             conn.close()
-            logger.info(f"Loaded {len(df)} rows from cache table: {table_name}")
+            logger.info(f"Loaded {len(df)} rows from cache table: {actual_table}")
             return df
         except Exception as e:
             logger.debug(f"Failed to load from cache table {table_name}: {e}")
@@ -760,41 +1011,39 @@ class FeatureStore:
 
         return name
 
-    def save_diffusion_long(
+    def _save_single_diffusion_param(
         self,
         df: pd.DataFrame,
         workflow: str,
+        param: str,
+        manifest: StoreManifest,
     ) -> str:
         """
-        Save raw diffusion parcellator output in long format.
-
-        If file exists, merges with existing data (removing duplicates).
+        Save a single param's diffusion data to its own Parquet file.
 
         Args:
-            df: Long-format DataFrame from DiffusionLoader
-            workflow: Workflow name (e.g., "AMICONODDI", "DSIStudio")
+            df: DataFrame for a single param
+            workflow: Workflow name
+            param: Parameter name
+            manifest: Active manifest (caller manages save)
 
         Returns:
-            Name of saved long format file
+            Manifest name (e.g., "diffusion_AMICONODDI_icvf")
         """
-        self._ensure_dirs()
-        manifest = self._load_manifest()
+        wf_dir = self.diffusion_long_dir / workflow
+        wf_dir.mkdir(parents=True, exist_ok=True)
+        file_path = wf_dir / f"{param}.parquet"
+        name = f"diffusion_{workflow}_{param}"
 
-        name = f"diffusion_{workflow}"
-        file_path = self.diffusion_long_dir / f"{workflow}.parquet"
-
-        # If file exists, merge with existing data to avoid data loss
+        # Merge with existing file if present
         if file_path.exists():
             logger.info(f"Merging with existing {name} data...")
             existing_df = pd.read_parquet(file_path)
-
-            # Combine and remove duplicates (keep new data)
             combined_df = pd.concat([existing_df, df], ignore_index=True)
             combined_df = combined_df.drop_duplicates(
                 subset=["subject_code", "session_id", "label"],
-                keep="last"  # Keep the newer data
+                keep="last",
             )
-
             logger.info(
                 f"Merged {len(existing_df)} existing + {len(df)} new = "
                 f"{len(combined_df)} total rows for {name}"
@@ -803,37 +1052,82 @@ class FeatureStore:
 
         df.to_parquet(file_path, compression=self.compression, index=False)
 
-        # Identify available summary statistics (mean, std, median, etc.)
         available_metrics = [c for c in df.columns if c in DIFFUSION_METRICS]
+        n_sessions = df[["subject_code", "session_id"]].drop_duplicates().shape[0]
+        n_subjects = df["subject_code"].nunique()
 
         info = LongFormatInfo(
             name=name,
             modality="diffusion",
             n_rows=len(df),
-            n_sessions=df[["subject_code", "session_id"]].drop_duplicates().shape[0],
+            n_sessions=n_sessions,
             columns=df.columns.tolist(),
             metrics_available=available_metrics,
             file_path=str(file_path.relative_to(self.root_dir)),
             created_at=datetime.now().isoformat(),
         )
         manifest.add_long_format(info)
-
-        n_sessions = df[["subject_code", "session_id"]].drop_duplicates().shape[0]
-        n_subjects = df["subject_code"].nunique()
         manifest.n_sessions = max(manifest.n_sessions, n_sessions)
         manifest.n_subjects = max(manifest.n_subjects, n_subjects)
 
-        self._save_manifest()
         logger.info(f"Saved {name}: {info.n_rows} rows, {info.n_sessions} sessions")
-
         return name
+
+    def save_diffusion_long(
+        self,
+        df: pd.DataFrame,
+        workflow: str,
+        param: Optional[str] = None,
+    ) -> Union[str, List[str]]:
+        """
+        Save raw diffusion parcellator output in long format, split by param.
+
+        Each param gets its own file: ``long/diffusion/{workflow}/{param}.parquet``.
+
+        Args:
+            df: Long-format DataFrame from DiffusionLoader
+            workflow: Workflow name (e.g., "AMICONODDI", "DSIStudio")
+            param: If provided, save only this param. Otherwise split by
+                   the ``param`` column in *df*.
+
+        Returns:
+            Single name when *param* is given, list of names otherwise.
+        """
+        self._ensure_dirs()
+        manifest = self._load_manifest()
+
+        if param is not None:
+            # Caller already isolated the param
+            name = self._save_single_diffusion_param(df, workflow, param, manifest)
+            self._save_manifest()
+            return name
+
+        # Split DataFrame by param column
+        if "param" in df.columns:
+            params = df["param"].unique()
+        else:
+            params = ["unknown"]
+
+        names: List[str] = []
+        for p in params:
+            p_str = str(p) if p else "unknown"
+            if "param" in df.columns:
+                param_df = df[df["param"] == p]
+            else:
+                param_df = df
+            name = self._save_single_diffusion_param(param_df, workflow, p_str, manifest)
+            names.append(name)
+
+        self._save_manifest()
+        return names
 
     def load_long(self, name: str, fallback_to_cache: bool = True) -> pd.DataFrame:
         """
         Load long-format data.
 
         Args:
-            name: Long format name (e.g., "anatomical_gm", "diffusion_AMICONODDI")
+            name: Long format name (e.g., "anatomical_gm",
+                  "diffusion_AMICONODDI_icvf")
             fallback_to_cache: If True, try loading from SQLite cache if Parquet doesn't exist
 
         Returns:
@@ -908,12 +1202,24 @@ class FeatureStore:
                 if modalities and not any(m in long_name for m in modalities):
                     continue
 
-                # Load long format
-                df = self.load_long(long_name)
                 source_mod = long_name.replace("anatomical_", "")  # gm, wm, ct
+                file_path = self.root_dir / long_info.file_path
 
-                # Generate wide for each metric
+                # Determine which metrics to generate
                 metrics_to_gen = metrics or long_info.metrics_available
+
+                # Load only the columns needed for pivoting (ID cols + metrics)
+                needed_cols = ["subject_code", "session_id", "label"] + [
+                    m for m in metrics_to_gen if m in long_info.columns
+                ]
+                # Filter to columns that actually exist in the file
+                needed_cols = [c for c in needed_cols if c in long_info.columns]
+
+                if file_path.exists():
+                    df = pd.read_parquet(file_path, columns=needed_cols)
+                else:
+                    df = self.load_long(long_name)
+
                 for metric in metrics_to_gen:
                     if metric not in df.columns:
                         continue
@@ -951,67 +1257,112 @@ class FeatureStore:
 
                     logger.info(f"Generated {feat_name}: {len(wide_df)} sessions, {len(region_cols)} regions")
 
-            elif long_info.modality == "diffusion":
-                # Load long format
-                df = self.load_long(long_name)
-                workflow = long_name.replace("diffusion_", "")
+                # Free modality data before processing next
+                del df
+                gc.collect()
 
-                # Determine region column
-                region_col = "name" if "name" in df.columns else "label"
-                if region_col not in df.columns:
+            elif long_info.modality == "diffusion":
+                file_path = self.root_dir / long_info.file_path
+
+                # Derive workflow and param from file path
+                # New format: long/diffusion/{workflow}/{param}.parquet
+                # Old format: long/diffusion/{workflow}.parquet
+                if file_path.parent.name != "diffusion":
+                    # New per-param layout
+                    workflow = file_path.parent.name
+                    param_from_path = file_path.stem
+                else:
+                    # Old layout (single file per workflow)
+                    workflow = file_path.stem
+                    param_from_path = None
+
+                # Peek at columns to determine region column and available metrics
+                all_columns = long_info.columns
+                region_col = "name" if "name" in all_columns else "label"
+                if region_col not in all_columns:
                     for alt in ["label", "name", "region"]:
-                        if alt in df.columns:
+                        if alt in all_columns:
                             region_col = alt
                             break
 
-                # Find available summary statistics in this diffusion data
-                available_metrics = [m for m in DIFFUSION_METRICS if m in df.columns]
+                available_metrics = [m for m in DIFFUSION_METRICS if m in all_columns]
                 if not available_metrics:
                     logger.warning(f"No summary statistics found in {long_name}")
                     continue
 
-                # Get unique model/param combinations
-                if "model" in df.columns and "param" in df.columns:
-                    for (model, param), group in df.groupby(["model", "param"]):
-                        # Generate wide format for each available summary statistic
-                        for metric in available_metrics:
-                            if metric not in group.columns:
-                                continue
+                # Load only needed columns: IDs + region + grouping + metrics
+                needed_cols = ["subject_code", "session_id", region_col]
+                if "model" in all_columns:
+                    needed_cols.append("model")
+                # Only need param column for old-format files
+                if param_from_path is None and "param" in all_columns:
+                    needed_cols.append("param")
+                needed_cols.extend(available_metrics)
+                # Deduplicate while preserving order
+                needed_cols = list(dict.fromkeys(needed_cols))
 
-                            # Feature name includes the summary statistic
-                            feat_name = f"{workflow}_{model}_{param}_{metric}"
-                            feat_path = self.diffusion_wide_dir / f"{feat_name}.parquet"
+                if file_path.exists():
+                    df = pd.read_parquet(file_path, columns=needed_cols)
+                else:
+                    df = self.load_long(long_name)
 
-                            # Pivot to wide
-                            wide_df = group.pivot_table(
-                                index=["subject_code", "session_id"],
-                                columns=region_col,
-                                values=metric,
-                                aggfunc="first",
-                            ).reset_index()
-                            wide_df.columns.name = None
+                # Determine the groupby strategy
+                if param_from_path is not None:
+                    # New per-param file: only group by model
+                    if "model" in df.columns:
+                        groups = [(model, param_from_path, grp) for model, grp in df.groupby("model")]
+                    else:
+                        groups = [("unknown", param_from_path, df)]
+                elif "model" in df.columns and "param" in df.columns:
+                    # Old format: group by both model and param
+                    groups = [
+                        (model, param, grp)
+                        for (model, param), grp in df.groupby(["model", "param"])
+                    ]
+                else:
+                    groups = []
 
-                            wide_df.to_parquet(feat_path, compression=self.compression, index=False)
+                for model, param, group in groups:
+                    for metric in available_metrics:
+                        if metric not in group.columns:
+                            continue
 
-                            region_cols = [c for c in wide_df.columns if c not in META_COLS]
+                        feat_name = f"{workflow}_{model}_{param}_{metric}"
+                        feat_path = self.diffusion_wide_dir / f"{feat_name}.parquet"
 
-                            info = FeatureInfo(
-                                name=feat_name,
-                                modality="diffusion",
-                                metric=metric,
-                                n_regions=len(region_cols),
-                                n_sessions=len(wide_df),
-                                region_names=region_cols,
-                                file_path=str(feat_path.relative_to(self.root_dir)),
-                                created_at=datetime.now().isoformat(),
-                                workflow=workflow,
-                                model=model,
-                                param=param,
-                            )
-                            manifest.add_feature(info)
-                            generated.append(feat_name)
+                        wide_df = group.pivot_table(
+                            index=["subject_code", "session_id"],
+                            columns=region_col,
+                            values=metric,
+                            aggfunc="first",
+                        ).reset_index()
+                        wide_df.columns.name = None
 
-                            logger.info(f"Generated {feat_name}: {len(wide_df)} sessions")
+                        wide_df.to_parquet(feat_path, compression=self.compression, index=False)
+
+                        region_cols = [c for c in wide_df.columns if c not in META_COLS]
+
+                        info = FeatureInfo(
+                            name=feat_name,
+                            modality="diffusion",
+                            metric=metric,
+                            n_regions=len(region_cols),
+                            n_sessions=len(wide_df),
+                            region_names=region_cols,
+                            file_path=str(feat_path.relative_to(self.root_dir)),
+                            created_at=datetime.now().isoformat(),
+                            workflow=workflow,
+                            model=model,
+                            param=param,
+                        )
+                        manifest.add_feature(info)
+                        generated.append(feat_name)
+
+                        logger.info(f"Generated {feat_name}: {len(wide_df)} sessions")
+
+                # Free workflow data before processing next
+                del df
+                gc.collect()
 
         self._save_manifest()
         return generated
@@ -1197,6 +1548,69 @@ class FeatureStore:
         # Save updated metadata
         meta_df.to_parquet(self.metadata_path, compression=self.compression, index=False)
         logger.debug(f"Updated load status: {subject_code}/{session_id} {col}={loaded}")
+
+    def queue_session_load_status(
+        self,
+        subject_code: str,
+        session_id: str,
+        modality: str,
+        loaded: bool = True,
+    ) -> None:
+        """
+        Queue a metadata update for later batch write (thread-safe, no immediate disk I/O).
+
+        Use flush_metadata_updates() to write all queued updates to disk.
+
+        Args:
+            subject_code: Subject identifier
+            session_id: Session identifier
+            modality: "gm", "wm", "ct", or "diffusion"
+            loaded: Whether data was loaded
+        """
+        with self._metadata_update_lock:
+            self._pending_metadata_updates.append((subject_code, session_id, modality, loaded))
+
+    def flush_metadata_updates(self) -> int:
+        """
+        Write all pending metadata updates to disk in a single operation.
+
+        Returns:
+            Number of updates flushed
+        """
+        with self._metadata_update_lock:
+            if not self._pending_metadata_updates:
+                return 0
+            updates = self._pending_metadata_updates.copy()
+            self._pending_metadata_updates.clear()
+
+        if not self.metadata_path.exists():
+            logger.warning("Metadata not initialized, cannot flush updates")
+            return 0
+
+        meta_df = self.load_metadata()
+
+        for subject_code, session_id, modality, loaded in updates:
+            mask = (meta_df["subject_code"] == subject_code) & (meta_df["session_id"] == session_id)
+
+            if not mask.any():
+                logger.debug(f"Session {subject_code}/{session_id} not found in metadata during flush")
+                continue
+
+            # Update appropriate column
+            if modality == "diffusion":
+                col = "diffusion_loaded"
+            else:
+                col = f"anatomical_{modality}_loaded"
+
+            if col not in meta_df.columns:
+                meta_df[col] = False
+
+            meta_df.loc[mask, col] = loaded
+
+        # Save all updates in one write
+        meta_df.to_parquet(self.metadata_path, compression=self.compression, index=False)
+        logger.info(f"Flushed {len(updates)} metadata updates to disk")
+        return len(updates)
 
     def save_metadata(self, df: pd.DataFrame, age_col: str = "AGE") -> None:
         """

@@ -6,7 +6,7 @@ with long format (raw parcellator output) and wide format (per metric) files.
 """
 
 import logging
-from concurrent.futures import ThreadPoolExecutor
+import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -459,6 +459,42 @@ class DataPreparationPipeline:
         logger.info(f"Extracted TIV for {len(tiv_df)} sessions")
         return tiv_df
 
+    def _extract_tiv_from_cache(self, store: FeatureStore) -> Optional[pd.DataFrame]:
+        """
+        Extract TIV from anatomical cache using a targeted SQL query.
+
+        Only reads subject_code, session_id, and tiv columns instead of
+        loading entire tables into memory.
+        """
+        if not store.cache_db_path.exists():
+            return None
+
+        conn = sqlite3.connect(store.cache_db_path)
+        try:
+            for modality in ["gm", "wm", "ct"]:
+                table_name = f"anatomical_{modality}"
+                try:
+                    # Check if table and tiv column exist
+                    cursor = conn.cursor()
+                    cursor.execute(f"PRAGMA table_info({table_name})")
+                    col_names = {row[1] for row in cursor.fetchall()}
+                    if "tiv" not in col_names:
+                        continue
+
+                    tiv_df = pd.read_sql(
+                        f"SELECT DISTINCT subject_code, session_id, tiv "
+                        f"FROM {table_name} WHERE tiv IS NOT NULL",
+                        conn,
+                    )
+                    if not tiv_df.empty:
+                        logger.info(f"Extracted TIV for {len(tiv_df)} sessions from cache")
+                        return tiv_df
+                except Exception:
+                    continue
+        finally:
+            conn.close()
+        return None
+
     def _prepare_metadata_df(
         self,
         anatomical_df: Optional[pd.DataFrame],
@@ -571,6 +607,12 @@ class DataPreparationPipeline:
             compression=self.config.output.compression,
         )
 
+        # When force=True, clear existing cache so stale/old-format tables
+        # don't persist alongside newly written ones.
+        if self.config.force and store.has_cache():
+            logger.info("Clearing existing cache (force=True)")
+            store.clear_cache()
+
         # Initialize metadata with ALL sessions (tracking load status)
         # Only initialize if metadata doesn't exist or force=True
         all_sessions = self._load_sessions_csv()
@@ -630,71 +672,47 @@ class DataPreparationPipeline:
         tiv_df = None
 
         # =====================================================================
-        # Load anatomical and diffusion data CONCURRENTLY with incremental saving
+        # Load anatomical and diffusion data SEQUENTIALLY to avoid lock contention
+        # Each loader uses its own ThreadPoolExecutor with n_jobs workers;
+        # running both concurrently would create 2×n_jobs threads competing for
+        # SQLite writes, causing significant lock contention.
         # =====================================================================
-        anatomical_df = None
-        diffusion_df = None
 
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            futures = {}
+        # Load anatomical data
+        if self.config.modalities.anatomical and not anatomical_sessions.empty:
+            anatomical_csv = temp_anatomical_csv if temp_anatomical_csv else None
+            try:
+                self.load_anatomical_data(anatomical_csv, store)
+            except Exception as e:
+                logger.error(f"Failed to load anatomical data: {e}")
+            # Flush batched metadata updates after anatomical loading completes
+            store.flush_metadata_updates()
+        elif self.config.modalities.anatomical:
+            logger.info("All anatomical sessions already loaded - skipping")
 
-            # Only load anatomical if there are sessions that need it
-            if self.config.modalities.anatomical and not anatomical_sessions.empty:
-                anatomical_csv = temp_anatomical_csv if temp_anatomical_csv else None
-                futures["anatomical"] = executor.submit(
-                    self.load_anatomical_data,
-                    anatomical_csv,
-                    store,  # Pass store for incremental saving
-                )
-            elif self.config.modalities.anatomical:
-                logger.info("All anatomical sessions already loaded - skipping")
-
-            # Only load diffusion if there are sessions that need it
-            if self.config.modalities.diffusion and not diffusion_sessions.empty:
-                diffusion_csv = temp_diffusion_csv if temp_diffusion_csv else None
-                futures["diffusion"] = executor.submit(
-                    self.load_diffusion_data,
-                    diffusion_csv,
-                    store,  # Pass store for incremental saving
-                )
-            elif self.config.modalities.diffusion:
-                logger.info("All diffusion sessions already loaded - skipping")
-
-            # Collect results
-            for name, future in futures.items():
-                try:
-                    result = future.result()
-                    if name == "anatomical":
-                        anatomical_df = result
-                    else:
-                        diffusion_df = result
-                except Exception as e:
-                    logger.error(f"Failed to load {name} data: {e}")
+        # Load diffusion data
+        if self.config.modalities.diffusion and not diffusion_sessions.empty:
+            diffusion_csv = temp_diffusion_csv if temp_diffusion_csv else None
+            try:
+                self.load_diffusion_data(diffusion_csv, store)
+            except Exception as e:
+                logger.error(f"Failed to load diffusion data: {e}")
+            # Flush batched metadata updates after diffusion loading completes
+            store.flush_metadata_updates()
+        elif self.config.modalities.diffusion:
+            logger.info("All diffusion sessions already loaded - skipping")
 
         # =====================================================================
         # Export cache to Parquet files
+        # (This already handles both anatomical and diffusion data)
         # =====================================================================
         logger.info("Exporting cached data to Parquet files...")
         long_formats_saved = store.export_cache_to_parquet(
             atlas_name=self.config.atlas_name
         )
 
-        # Extract TIV from anatomical data if available
-        if anatomical_df is not None and len(anatomical_df) > 0:
-            tiv_df = self._extract_tiv(anatomical_df)
-
-        # =====================================================================
-        # Save diffusion data (long format per workflow)
-        # =====================================================================
-
-        if diffusion_df is not None and len(diffusion_df) > 0:
-            logger.info("Saving diffusion long format data...")
-
-            # Save each workflow separately
-            for workflow in diffusion_df["workflow"].unique():
-                wf_df = diffusion_df[diffusion_df["workflow"] == workflow].copy()
-                name = store.save_diffusion_long(wf_df, workflow=workflow)
-                long_formats_saved.append(name)
+        # Extract TIV from cache instead of keeping full DataFrame in memory
+        tiv_df = self._extract_tiv_from_cache(store)
 
         # Clean up temp files
         for temp_csv in [temp_anatomical_csv, temp_diffusion_csv]:
@@ -768,7 +786,7 @@ class DataPreparationPipeline:
     def sanitize_session_id(session_id: str) -> str:
         """Sanitize session ID by removing problematic characters."""
         if pd.isna(session_id):
-            return
+            return ""  # Return empty string instead of None
         return (
             str(int(float(session_id)))
             .replace("/", "_")

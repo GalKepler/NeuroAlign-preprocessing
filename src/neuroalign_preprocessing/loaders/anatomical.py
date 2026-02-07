@@ -24,6 +24,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from neuroalign_preprocessing.utils.sessions import sanitize_session_id, sanitize_subject_code
 import pandas as pd
 
 logger = logging.getLogger(__name__)
@@ -316,12 +317,6 @@ class AnatomicalLoader:
             modalities=session_modalities,
         )
 
-        if session_data is not None:
-            # Add metadata columns from sessions CSV
-            for col, val in row.items():
-                if col not in session_data.columns and not col.startswith("_"):
-                    session_data[col] = val
-
         return subject, session, session_data
 
     def load_sessions(
@@ -356,13 +351,18 @@ class AnatomicalLoader:
         Returns:
             DataFrame with all sessions' regional features
         """
-        sessions = pd.read_csv(
-            sessions_csv, dtype={"subject_code": str, "session_id": str}
-        )
+        sessions = pd.read_csv(sessions_csv)
+        # Sanitize subject codes and session IDs
+        sessions["subject_code"] = sessions["subject_code"].apply(sanitize_subject_code)
+        sessions["session_id"] = sessions["session_id"].apply(sanitize_session_id)
+        for col in sessions.select_dtypes(include=["object"]).columns:
+            sessions[col] = sessions[col].str.strip()
         effective_jobs = n_jobs if n_jobs is not None else self.n_jobs
 
         if effective_jobs == 1:
-            df = self._load_sessions_serial(sessions, progress, calculate_tiv, session_callback, modalities)
+            df = self._load_sessions_serial(
+                sessions, progress, calculate_tiv, session_callback, modalities
+            )
         else:
             df = self._load_sessions_parallel(
                 sessions, progress, effective_jobs, calculate_tiv, session_callback, modalities
@@ -376,9 +376,7 @@ class AnatomicalLoader:
                     df.loc[volume_mask, "volume_mm3_normalized"] = (
                         df.loc[volume_mask, "volume_mm3"] / df.loc[volume_mask, "tiv"]
                     )
-                    logger.info(
-                        f"Normalized {volume_mask.sum()} volume measurements by TIV"
-                    )
+                    logger.info(f"Normalized {volume_mask.sum()} volume measurements by TIV")
 
         return df
 
@@ -410,9 +408,7 @@ class AnatomicalLoader:
             try:
                 from tqdm import tqdm
 
-                iterator = tqdm(
-                    iterator, total=len(sessions), desc="Loading anatomical data"
-                )
+                iterator = tqdm(iterator, total=len(sessions), desc="Loading anatomical data")
             except ImportError:
                 pass
 
@@ -432,11 +428,6 @@ class AnatomicalLoader:
             )
 
             if session_data is not None:
-                # Add metadata columns from sessions CSV
-                for col in sessions.columns:
-                    if col not in session_data.columns and not col.startswith("_"):
-                        session_data[col] = row[col]
-
                 # Call callback if provided
                 if session_callback is not None:
                     try:
@@ -444,10 +435,15 @@ class AnatomicalLoader:
                     except Exception as e:
                         logger.warning(f"Session callback failed for {subject}/{session}: {e}")
 
-                results.append(session_data)
+                # Only accumulate in memory if no callback is persisting data
+                if session_callback is None:
+                    results.append(session_data)
 
-        if not results:
+        if not results and session_callback is None:
             raise ValueError("No sessions successfully loaded")
+
+        if session_callback is not None:
+            return pd.DataFrame()
 
         return pd.concat(results, ignore_index=True, copy=False)
 
@@ -501,9 +497,7 @@ class AnatomicalLoader:
                 try:
                     from tqdm import tqdm
 
-                    iterator = tqdm(
-                        iterator, total=len(futures), desc="Loading anatomical data"
-                    )
+                    iterator = tqdm(iterator, total=len(futures), desc="Loading anatomical data")
                 except ImportError:
                     pass
 
@@ -516,17 +510,19 @@ class AnatomicalLoader:
                             try:
                                 session_callback(subject, session, session_data)
                             except Exception as e:
-                                logger.warning(f"Session callback failed for {subject}/{session}: {e}")
+                                logger.warning(
+                                    f"Session callback failed for {subject}/{session}: {e}"
+                                )
 
-                        results.append(session_data)
+                        # Only accumulate in memory if no callback is persisting data
+                        if session_callback is None:
+                            results.append(session_data)
                         success_count += 1
                         logger.debug(f"  SUCCESS: sub-{subject}_ses-{session}")
                     else:
                         skip_count += 1
                         failed_sessions.append((subject, session, "no_data"))
-                        logger.debug(
-                            f"  SKIP: sub-{subject}_ses-{session} - no data found"
-                        )
+                        logger.debug(f"  SKIP: sub-{subject}_ses-{session} - no data found")
                 except Exception as e:
                     error_count += 1
                     logger.error(f"Worker exception: {e}", exc_info=True)
@@ -544,13 +540,18 @@ class AnatomicalLoader:
             if len(failed_sessions) > 50:
                 logger.debug(f"  ... and {len(failed_sessions) - 50} more")
 
-        if not results:
+        if success_count == 0:
             logger.error(
                 f"No sessions successfully loaded. "
                 f"Attempted {len(sessions)} sessions. "
                 f"Success: {success_count}, Skipped: {skip_count}, Errors: {error_count}"
             )
             raise ValueError("No sessions successfully loaded")
+
+        # When callback was used, data is already persisted - return empty DataFrame
+        if session_callback is not None:
+            logger.info(f"Successfully loaded and saved {success_count} sessions via callback")
+            return pd.DataFrame()
 
         logger.info(f"Successfully loaded {len(results)} sessions")
         return pd.concat(results, ignore_index=True, copy=False)

@@ -1,7 +1,7 @@
 [project]
 name = "neuroalign-preprocessing"
-version = "0.1.0"
-description = "Neuroimaging data preprocessing pipeline for NeuroAlign"
+version = "0.2.0"
+description = "Aggregate pre-parcellated neuroimaging TSVs into long-format Parquet files"
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "MIT"}
@@ -12,13 +12,8 @@ dependencies = [
     "numpy>=1.24.0",
     "pandas>=2.0.0",
     "pyarrow>=12.0.0",
-    "nibabel>=5.0.0",
-    "scipy>=1.10.0",
     "tqdm>=4.65.0",
-    "pyyaml>=6.0",
     "python-dotenv>=1.0.0",
-    "pydantic>=2.0.0",
-    "duckdb>=1.4.4",
 ]
 
 [project.optional-dependencies]
@@ -31,8 +26,7 @@ dev = [
 ]
 
 [project.scripts]
-neuroalign-preprocess = "neuroalign_preprocessing.preprocessing.cli:main"
-neuroalign-export-cache = "neuroalign_preprocessing.preprocessing.export_cache:main"
+neuroalign-preprocess = "neuroalign_preprocessing.cli:main"
 
 [build-system]
 requires = ["hatchling"]

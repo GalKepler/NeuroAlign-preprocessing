@@ -27,6 +27,7 @@ from tqdm import tqdm
 
 from .parsers import parse_bids_entities, read_parcellation
 from .sessions import load_sessions
+from .naming_utils import generate_parquet_filename
 
 logger = logging.getLogger(__name__)
 
@@ -101,6 +102,7 @@ def aggregate_cat12(
     atlas: str,
     tissues: tuple[str, ...] = ("GM", "WM", "CT"),
     mask: Optional[str] = "gm",
+    maskthr: Optional[int] = None,
     compression: Optional[str] = "snappy",
 ) -> dict[str, int]:
     """Aggregate CAT12 parcellated TSVs into per-tissue Parquet files.
@@ -141,7 +143,13 @@ def aggregate_cat12(
     results: dict[str, int] = {}
 
     for tissue in tissues:
-        out_path = cat12_out / f"{tissue.lower()}.parquet"
+        filename = generate_parquet_filename(
+            entities={'atlas': atlas, 'tissue': tissue},
+            modality='cat12',
+            mask=mask,
+            maskthr=maskthr
+        )
+        out_path = cat12_out / filename
         n_missing = 0
 
         with _StreamingParquetWriter(out_path, compression) as writer:
@@ -188,6 +196,7 @@ def aggregate_qsiparc(
     output_dir: Path,
     atlas: str,
     mask: str = "gm",
+    maskthr: Optional[int] = None,
     compression: Optional[str] = "snappy",
 ) -> dict[str, int]:
     """Aggregate QSIParc parcellated TSVs into per-workflow/param Parquet files.
@@ -266,7 +275,12 @@ def aggregate_qsiparc(
 
         writers: dict[tuple[str, str], _StreamingParquetWriter] = {
             combo: _StreamingParquetWriter(
-                wf_out / f"{combo[0]}_{combo[1]}.parquet", compression
+                wf_out / generate_parquet_filename(
+                    entities={'atlas': atlas, 'model': combo[0], 'param': combo[1]},
+                    modality='qsiparc',
+                    mask=mask,
+                    maskthr=maskthr
+                ), compression
             )
             for combo in combo_keys
         }
@@ -295,7 +309,12 @@ def aggregate_qsiparc(
                     if combo not in writers:
                         # New combo discovered mid-run — add a writer for it
                         writers[combo] = _StreamingParquetWriter(
-                            wf_out / f"{model}_{param}.parquet", compression
+                            wf_out / generate_parquet_filename(
+                                entities={'atlas': atlas, 'model': model, 'param': param},
+                                modality='qsiparc',
+                                mask=mask,
+                                maskthr=maskthr
+                            ), compression
                         )
                     df = read_parcellation(
                         tsv_path,

@@ -55,6 +55,12 @@ def main() -> int:
         help="Mask label used in parcellated filenames",
     )
     parser.add_argument(
+        "--maskthr",
+        type=int,
+        default=None,
+        help="Mask threshold value to include in output filename (e.g., 50)",
+    )
+    parser.add_argument(
         "--output", "-o",
         type=Path,
         default=Path("data/parcellations"),
@@ -91,14 +97,14 @@ def main() -> int:
             "Error: --sessions / SESSIONS_CSV is required.",
             file=sys.stderr,
         )
-        return 1
+        sys.exit(1)
 
     if not args.cat12_root and not args.qsiparc_root:
         print(
             "Error: at least one of --cat12-root / --qsiparc-root must be set.",
             file=sys.stderr,
         )
-        return 1
+        sys.exit(1)
 
     compression = None if args.compression == "none" else args.compression
     args.output.mkdir(parents=True, exist_ok=True)
@@ -115,6 +121,7 @@ def main() -> int:
             atlas=args.atlas,
             tissues=tuple(args.tissues),
             mask=args.mask,
+            maskthr=args.maskthr,
             compression=compression,
         )
         for tissue, n in results.items():
@@ -128,6 +135,7 @@ def main() -> int:
             output_dir=args.output,
             atlas=args.atlas,
             mask=args.mask,
+            maskthr=args.maskthr,
             compression=compression,
         )
         for key, n in results.items():
@@ -135,4 +143,4 @@ def main() -> int:
             total_rows += n
 
     print(f"\nDone. {total_rows:,} total rows written to {args.output}/")
-    return 0
+    sys.exit(0)
